@@ -121,7 +121,7 @@ impl Publisher {
             config.channels,
             config.pairing_code,
             config.reconnect,
-        );
+        )?;
         let (events_tx, events_rx) = mpsc::channel();
         let (stop, stop_rx) = watch::channel(Stop::Run);
         let (done_tx, done) = mpsc::channel();

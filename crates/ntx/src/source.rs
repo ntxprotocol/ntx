@@ -7,10 +7,12 @@ use mdns_sd::{ServiceDaemon, ServiceInfo};
 use tokio::sync::{mpsc as tmpsc, watch};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::protocol::{Endpoint, Fields, Hello, Message, Subscribe, Tally, TypeDescriptor};
+use crate::protocol::{
+    Endpoint, Fields, Hello, MAX_NAME_CHARS, Message, Subscribe, Tally, TypeDescriptor, check_endpoint,
+};
 use crate::store::{Store, text_shortcuts};
 use crate::wire::{self, Ended, Incoming, lock};
-use crate::{DEFAULT_PORT, Error, PROGRAM, PROTOCOL_VERSION, Result, SERVICE_TYPE};
+use crate::{DEFAULT_PORT, Error, PROGRAM, PROTOCOL_VERSION, Result, SERVICE_TYPE, text};
 
 /// Settings for a [`Source`].
 #[derive(Debug, Clone)]
@@ -113,13 +115,19 @@ impl Source {
     ///
     /// # Errors
     ///
-    /// Fails if the channels lack `program`, the port cannot be opened, or mDNS cannot start.
+    /// Fails if the id or name is empty or too long, the channels lack `program`, the port cannot
+    /// be opened, or mDNS cannot start.
     pub fn start(config: SourceConfig) -> Result<Source> {
         Source::start_with(config, None)
     }
 
     /// Like [`Source::start`], advertising with `mdns` when given instead of a daemon of its own.
     pub(crate) fn start_with(config: SourceConfig, mdns: Option<Arc<Mdns>>) -> Result<Source> {
+        let identity = Endpoint {
+            id: config.id.clone(),
+            name: config.name.clone(),
+        };
+        check_endpoint(&identity)?;
         let store = Store::new(config.channels.clone())?;
         let (listener, local_addr) = wire::listen(config.bind, config.port)?;
         let mdns = if config.advertise {
@@ -135,10 +143,7 @@ impl Source {
 
         let (events_tx, events_rx) = mpsc::channel();
         let shared = Arc::new(Shared {
-            identity: Endpoint {
-                id: config.id,
-                name: config.name,
-            },
+            identity,
             path: config.path,
             pairing_code: config.pairing_code,
             session: uuid::Uuid::new_v4().simple().to_string(),
@@ -246,12 +251,14 @@ impl Drop for Source {
     }
 }
 
-/// `MACHINE (name)`: the form of display name the spec recommends (clause 8.2).
+/// `MACHINE (name)`: the form of display name the spec recommends (clause 8.2), shortened to
+/// the 256 characters `hello` allows (clause 6.2).
 #[must_use]
 pub fn display_name(name: &str) -> String {
     let host = gethostname::gethostname().to_string_lossy().into_owned();
     let machine = host.split('.').next().unwrap_or(&host).to_uppercase();
-    format!("{machine} ({name})")
+    let name = format!("{machine} ({name})");
+    text::shorten(&name, MAX_NAME_CHARS, text::chars).to_string()
 }
 
 /// An mDNS daemon, shut down when its last user is dropped. A relay shares one between the
@@ -308,10 +315,10 @@ fn advertise(daemon: &ServiceDaemon, config: &SourceConfig, port: u16) -> Result
     Ok(fullname)
 }
 
-/// Shortens a name to the 63-byte limit of a DNS label (clause 6.2), keeping whole characters.
-/// Longer names make mDNS answers empty, so nobody would find the source.
+/// Shortens a name to the 63-byte limit of a DNS label (clause 6.2), keeping whole characters
+/// and clusters. Longer names make mDNS answers empty, so nobody would find the source.
 fn dns_label(name: &str) -> &str {
-    wire::cut(name, 63)
+    text::shorten(name, 63, str::len)
 }
 
 /// Serves one receiver from WebSocket upgrade to disconnect.
@@ -435,5 +442,14 @@ mod tests {
         // "Ọ" is 3 bytes: never cut a character in half.
         let accented = "Ọ".repeat(30);
         assert_eq!(dns_label(&accented), "Ọ".repeat(21));
+        // "Ọ́" with a combining accent is 5 bytes: never split it from its accent either.
+        let marked = "\u{1ECC}\u{0301}".repeat(13);
+        assert_eq!(dns_label(&marked), "\u{1ECC}\u{0301}".repeat(12));
+    }
+
+    #[test]
+    fn display_names_fit_in_hello() {
+        let name = super::display_name(&"n".repeat(300));
+        assert_eq!(name.chars().count(), 256);
     }
 }

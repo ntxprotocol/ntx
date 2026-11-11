@@ -9,7 +9,9 @@ use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 
-use crate::protocol::{Endpoint, ErrorCode, ErrorMessage, Hello, Message, PairingProof, Publish, Subscribe};
+use crate::protocol::{
+    Endpoint, ErrorCode, ErrorMessage, Hello, Message, PairingProof, Publish, Subscribe, check_endpoint,
+};
 use crate::wire::{self, Ended, HANDSHAKE_TIMEOUT, Peer};
 use crate::{DEFAULT_PORT, Error, PROTOCOL_VERSION, Result, SUBPROTOCOL, pairing};
 
@@ -67,15 +69,17 @@ impl Settings {
         channels: Vec<String>,
         pairing_code: Option<String>,
         reconnect: bool,
-    ) -> Settings {
-        Settings {
+    ) -> Result<Settings> {
+        let me = Endpoint { id, name };
+        check_endpoint(&me)?;
+        Ok(Settings {
             role,
             url,
-            me: Endpoint { id, name },
+            me,
             channels,
             pairing_code,
             reconnect,
-        }
+        })
     }
 
     /// The answer to `hello`, with the pairing proof if one was asked for.

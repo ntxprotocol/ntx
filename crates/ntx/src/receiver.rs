@@ -100,7 +100,7 @@ impl Receiver {
             config.channels,
             config.pairing_code,
             config.reconnect,
-        );
+        )?;
         let link = Link {
             settings,
             events: events_tx,

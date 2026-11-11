@@ -459,9 +459,13 @@ fn check_len(what: &str, s: &str, min: usize, max: usize) -> Result<()> {
     Ok(())
 }
 
-fn check_endpoint(e: &Endpoint) -> Result<()> {
+/// Longest `name` of a source, receiver or publisher, in characters (clause 18.4).
+pub(crate) const MAX_NAME_CHARS: usize = 256;
+
+/// Checks the id and name of a source, receiver or publisher (clause 18.4).
+pub(crate) fn check_endpoint(e: &Endpoint) -> Result<()> {
     check_len("id", &e.id, 1, 128)?;
-    check_len("name", &e.name, 1, 256)
+    check_len("name", &e.name, 1, MAX_NAME_CHARS)
 }
 
 fn check_channels(channels: &[String], needs_program: bool) -> Result<()> {
