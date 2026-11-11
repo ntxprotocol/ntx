@@ -252,6 +252,11 @@ fn null_and_long_origins_are_refused_cleanly() {
     assert_eq!(read_close(&mut ws), 4003);
     assert_eq!(relay.wait_event(Duration::from_millis(200)), None);
 
+    // So is anything that is not http(s)://host[:port].
+    let mut ws = raw_connect_from(&url(&relay), Some("chrome-extension://abcdef"));
+    assert_eq!(read_json(&mut ws)["code"], "not_allowed");
+    assert_eq!(relay.wait_event(Duration::from_millis(200)), None);
+
     // The close reason must fit in a close frame (125 bytes); the error keeps the whole origin.
     let long = format!("https://{}.example", "a".repeat(200));
     let mut ws = raw_connect_from(&url(&relay), Some(&long));
@@ -276,4 +281,19 @@ fn a_publisher_dropped_before_connecting_still_delivers() {
     let update = read(&mut ws);
     assert_eq!(update["fields"]["text"], "hi");
     dropping.join().unwrap();
+}
+
+#[test]
+fn pages_cannot_flood_the_user_with_questions() {
+    let relay = relay(None, &[]);
+    for page in ["https://a.example", "https://b.example", "https://c.example"] {
+        let mut ws = raw_connect_from(&url(&relay), Some(page));
+        assert_eq!(read_json(&mut ws)["code"], "not_allowed");
+    }
+    // At most one question per second.
+    assert!(matches!(
+        relay.wait_event(WAIT),
+        Some(RelayEvent::OriginRequested { .. })
+    ));
+    assert_eq!(relay.wait_event(Duration::from_millis(300)), None);
 }

@@ -242,3 +242,70 @@ fn receiver_reports_a_refused_connection() {
     let r = one_shot_receiver(&url);
     assert_ne!(disconnect_reason(&r), "");
 }
+
+#[test]
+fn idle_connections_are_limited_and_time_out() {
+    use std::io::Read;
+    let s = source(None);
+    // Sockets that never send an upgrade request: one address may hold 16 places at most.
+    let mut idle: Vec<_> = (0..16)
+        .map(|_| std::net::TcpStream::connect(s.local_addr()).unwrap())
+        .collect();
+    let one_too_many = tungstenite::connect(format!("ws://{}/", s.local_addr()));
+    assert!(one_too_many.is_err(), "a connection over the limit was served");
+    // Without an upgrade within 10 seconds, the source closes them and frees their places.
+    idle[0].set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+    assert_eq!(idle[0].read(&mut [0; 16]).unwrap(), 0);
+    let r = common::receiver(&s, &["program"], None);
+    common::next_update(&r);
+}
+
+#[test]
+fn a_receiver_that_stops_reading_is_dropped() {
+    let s = source(None);
+    let _stalled = subscribed(&s); // never read again
+    wait_for(
+        || s.wait_event(WAIT),
+        |e| matches!(e, SourceEvent::ReceiverConnected { .. }).then_some(()),
+    );
+    // Far more than fits in socket buffers and the queue: memory must not grow without bound.
+    let big = "x".repeat(60_000);
+    for _ in 0..1000 {
+        s.update_text("program", &big).unwrap();
+    }
+    wait_for(
+        || s.wait_event(Duration::from_secs(25)),
+        |e| matches!(e, SourceEvent::ReceiverDisconnected { .. }).then_some(()),
+    );
+    assert_eq!(s.receiver_count(), 0);
+}
+
+#[test]
+fn repeated_wrong_pairing_codes_lock_the_address_out() {
+    let s = source(Some("1234"));
+    let url = format!("ws://{}/", s.local_addr());
+    let attempt = |code: &str| {
+        let mut ws = raw_connect(&url);
+        let nonce = read_json(&mut ws)["pairing"]["nonce"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut answer = subscribe("0.1");
+        answer["pairing"] = json!({"proof": ntx::pairing::proof(code, &nonce)});
+        send_json(&mut ws, &answer);
+        read_json(&mut ws)
+    };
+    // Guesses in parallel are counted too.
+    std::thread::scope(|scope| {
+        let guesses: Vec<_> = (0..10).map(|_| scope.spawn(|| attempt("0000"))).collect();
+        for guess in guesses {
+            assert_eq!(guess.join().unwrap()["code"], "pairing_failed");
+        }
+    });
+    let locked = attempt("1234");
+    assert_eq!(locked["code"], "pairing_failed");
+    assert!(
+        locked["message"].as_str().unwrap().contains("try again later"),
+        "{locked}"
+    );
+}

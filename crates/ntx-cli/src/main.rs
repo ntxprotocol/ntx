@@ -263,7 +263,7 @@ fn relay(args: &RelayArgs) -> CliResult {
             port,
             ..
         } => format!(
-            "+ publisher #{connection} \"{}\" from {address}, served on port {port}",
+            "+ publisher #{connection} from {address}: serving \"{}\" at ws://127.0.0.1:{port}/",
             source.name
         ),
         RelayEvent::PublisherDisconnected { connection } => format!("- publisher #{connection}"),

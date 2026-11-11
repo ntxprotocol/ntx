@@ -1,6 +1,7 @@
 //! The WebSocket side shared by every endpoint: listening, sending, receiving, heartbeats and
 //! errors.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -78,6 +79,25 @@ fn normalize_strings(value: &mut Value) {
     }
 }
 
+/// Most frames waiting for one connection. State is latest-wins, so a peer that falls this far
+/// behind is dropped rather than queued for; it gets the whole state again when it reconnects.
+const QUEUE: usize = 256;
+
+/// A queue of frames for one connection.
+pub(crate) fn queue() -> (mpsc::Sender<WsMessage>, mpsc::Receiver<WsMessage>) {
+    mpsc::channel(QUEUE)
+}
+
+/// Queues `frame` for a connection. A full or closed queue is let go, which ends that
+/// connection (see [`pump`]). Returns whether the frame was queued.
+pub(crate) fn enqueue(out: &mut Option<mpsc::Sender<WsMessage>>, frame: WsMessage) -> bool {
+    let queued = out.as_ref().is_some_and(|out| out.try_send(frame).is_ok());
+    if !queued {
+        *out = None;
+    }
+    queued
+}
+
 /// Opens a listening TCP socket for the background runtime.
 pub(crate) fn listen(bind: IpAddr, port: u16) -> crate::Result<(TcpListener, SocketAddr)> {
     let listener = std::net::TcpListener::bind((bind, port))?;
@@ -87,12 +107,95 @@ pub(crate) fn listen(bind: IpAddr, port: u16) -> crate::Result<(TcpListener, Soc
     Ok((TcpListener::from_std(listener)?, local_addr))
 }
 
+/// Most connections one endpoint serves at once.
+const MAX_CONNECTIONS: usize = 64;
+
+/// Most connections one endpoint serves at once from one IP address. Higher than a relay's
+/// per-origin limit, because every local publisher comes from the loopback address.
+const MAX_CONNECTIONS_PER_ADDRESS: usize = 16;
+
+/// Wrong pairing codes from one IP address before it is locked out (clause 13.4).
+const MAX_PAIRING_FAILURES: u32 = 10;
+
+/// How long a lockout lasts, and how long failures are remembered.
+const PAIRING_LOCKOUT: Duration = Duration::from_secs(60);
+
+/// The connections and pairing failures of one listening endpoint, per IP address.
+#[derive(Default)]
+struct Limits {
+    connections: Mutex<HashMap<IpAddr, usize>>,
+    /// Failures and the time of the last one.
+    pairing_failures: Mutex<HashMap<IpAddr, (u32, Instant)>>,
+}
+
+/// A connection within the limits. Its place is freed when the slot is dropped.
+pub(crate) struct Slot {
+    limits: Arc<Limits>,
+    ip: IpAddr,
+}
+
+impl Slot {
+    /// Takes a place for a connection from `ip`, if the limits allow it.
+    fn take(limits: &Arc<Limits>, ip: IpAddr) -> Option<Slot> {
+        let mut connections = lock(&limits.connections);
+        let total: usize = connections.values().sum();
+        let from_ip = connections.entry(ip).or_default();
+        if total >= MAX_CONNECTIONS || *from_ip >= MAX_CONNECTIONS_PER_ADDRESS {
+            return None;
+        }
+        *from_ip += 1;
+        Some(Slot {
+            limits: limits.clone(),
+            ip,
+        })
+    }
+
+    /// Whether this address made too many wrong pairing attempts recently.
+    fn locked_out(&self) -> bool {
+        let failures = lock(&self.limits.pairing_failures);
+        failures
+            .get(&self.ip)
+            .is_some_and(|&(count, last)| count >= MAX_PAIRING_FAILURES && last.elapsed() < PAIRING_LOCKOUT)
+    }
+
+    fn pairing_failed(&self) {
+        let mut failures = lock(&self.limits.pairing_failures);
+        failures.retain(|_, (_, last)| last.elapsed() < PAIRING_LOCKOUT);
+        let entry = failures.entry(self.ip).or_insert((0, Instant::now()));
+        *entry = (entry.0 + 1, Instant::now());
+    }
+
+    fn paired(&self) {
+        lock(&self.limits.pairing_failures).remove(&self.ip);
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut connections = lock(&self.limits.connections);
+        if let Some(count) = connections.get_mut(&self.ip) {
+            *count -= 1;
+            if *count == 0 {
+                connections.remove(&self.ip);
+            }
+        }
+    }
+}
+
+/// A new TCP connection within the limits.
+pub(crate) struct Incoming {
+    pub(crate) stream: TcpStream,
+    pub(crate) address: SocketAddr,
+    pub(crate) slot: Slot,
+}
+
 /// Accepts connections on the background runtime, serving each one on its own task with
-/// `serve(stream, address, shared, stop)`. Stops when the returned sender sends `true`.
+/// `serve(incoming, shared, stop)`. Connections over the limits are closed at once, before the
+/// WebSocket upgrade. Stops when the returned sender sends `true`.
 pub(crate) fn serve_connections<T, Fut>(
     listener: TcpListener,
     shared: Arc<T>,
-    serve: fn(TcpStream, SocketAddr, Arc<T>, watch::Receiver<bool>) -> Fut,
+    serve: fn(Incoming, Arc<T>, watch::Receiver<bool>) -> Fut,
 ) -> watch::Sender<bool>
 where
     T: Send + Sync + 'static,
@@ -106,17 +209,23 @@ where
 async fn accept_loop<T, Fut>(
     listener: TcpListener,
     shared: Arc<T>,
-    serve: fn(TcpStream, SocketAddr, Arc<T>, watch::Receiver<bool>) -> Fut,
+    serve: fn(Incoming, Arc<T>, watch::Receiver<bool>) -> Fut,
     mut stop: watch::Receiver<bool>,
 ) where
     Fut: Future<Output = ()> + Send + 'static,
 {
+    let limits = Arc::new(Limits::default());
     loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, address)) => {
+                    let Some(slot) = Slot::take(&limits, address.ip()) else {
+                        tracing::debug!("too many connections; closed one from {address}");
+                        continue;
+                    };
                     let _ = stream.set_nodelay(true);
-                    tokio::spawn(serve(stream, address, shared.clone(), stop.clone()));
+                    let incoming = Incoming { stream, address, slot };
+                    tokio::spawn(serve(incoming, shared.clone(), stop.clone()));
                 }
                 Err(e) => {
                     tracing::warn!("accept failed: {e}");
@@ -149,7 +258,10 @@ pub(crate) async fn accept(
         },
         Some(ws_config()),
     );
-    let ws = upgrade.await.map_err(|e| Ended(e.to_string()))?;
+    let ws = tokio::time::timeout(HANDSHAKE_TIMEOUT, upgrade)
+        .await
+        .map_err(|_| Ended("no WebSocket upgrade".into()))?
+        .map_err(|e| Ended(e.to_string()))?;
     Ok((Peer::new(ws, handshake), origin))
 }
 
@@ -193,7 +305,7 @@ pub(crate) type Refusal = Option<(ErrorCode, String)>;
 /// the frames still queued, then closes (with the error `stop` gives, if any).
 pub(crate) async fn pump<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     peer: &mut Peer<S>,
-    out: &mut mpsc::UnboundedReceiver<WsMessage>,
+    out: &mut mpsc::Receiver<WsMessage>,
     stop: impl Future<Output = Refusal>,
     mut handle: impl FnMut(Message),
 ) -> Ended {
@@ -268,8 +380,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Peer<S> {
         self.send_frame(WsMessage::text(message.to_json())).await
     }
 
+    /// Sends one frame. A peer that stops reading for [`DEAD_AFTER`] is given up on, so a stalled
+    /// peer cannot hold the connection open.
     pub(crate) async fn send_frame(&mut self, frame: WsMessage) -> Result<(), Ended> {
-        self.sink.send(frame).await.map_err(|e| Ended(e.to_string()))
+        tokio::time::timeout(DEAD_AFTER, self.sink.send(frame))
+            .await
+            .map_err(|_| Ended("peer stopped reading".into()))?
+            .map_err(|e| Ended(e.to_string()))
     }
 
     /// Sends `error` and closes the connection with the matching close code (clause 12).
@@ -419,6 +536,7 @@ fn is_other_version(text: &str, op: &str) -> bool {
 /// returns the answer with its version and pairing proof, which are then checked.
 pub(crate) async fn greet<T>(
     peer: &mut Peer<TcpStream>,
+    slot: &Slot,
     mut hello: Hello,
     pairing_code: Option<&str>,
     pick: impl Fn(Message) -> Option<(T, String, Option<PairingProof>)>,
@@ -433,7 +551,7 @@ pub(crate) async fn greet<T>(
             }
         };
         let pairing = pairing_code.zip(nonce.as_deref());
-        if let Err((code, reason)) = check_answer(&ntx, pairing, proof.as_ref()).await {
+        if let Err((code, reason)) = check_answer(&ntx, pairing, proof.as_ref(), slot).await {
             return Err(peer.reject(code, reason).await);
         }
         peer.handshake_done();
@@ -446,20 +564,31 @@ pub(crate) async fn greet<T>(
 
 /// Checks the version and pairing proof of a `subscribe` or `publish` (clauses 13.4, 19.3).
 /// `pairing` holds the pairing code and the nonce sent in `hello`, when pairing is required.
+/// Guessing is slowed down (clause 13.4): each failure waits a second, and an address with too
+/// many recent failures is locked out for a while, however many connections it opens.
 async fn check_answer(
     ntx: &str,
     pairing: Option<(&str, &str)>,
     proof: Option<&PairingProof>,
+    slot: &Slot,
 ) -> Result<(), (ErrorCode, String)> {
     check_version(ntx)?;
     if let Some((code, nonce)) = pairing {
         let Some(proof) = proof else {
             return Err((ErrorCode::PairingRequired, "a pairing code is needed".into()));
         };
-        if !pairing::verify(code, nonce, &proof.proof) {
-            tokio::time::sleep(Duration::from_secs(1)).await; // slow down guessing (clause 13.4)
-            return Err((ErrorCode::PairingFailed, "wrong pairing code".into()));
+        let locked_out = slot.locked_out();
+        if locked_out || !pairing::verify(code, nonce, &proof.proof) {
+            slot.pairing_failed();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let reason = if locked_out {
+                "too many wrong pairing codes; try again later"
+            } else {
+                "wrong pairing code"
+            };
+            return Err((ErrorCode::PairingFailed, reason.into()));
         }
+        slot.paired();
     }
     Ok(())
 }

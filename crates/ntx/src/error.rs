@@ -27,8 +27,8 @@ pub enum Error {
     #[error("invalid address {0:?}")]
     InvalidAddress(String),
 
-    /// A web origin is not of the form `scheme://host[:port]` (clause 14.5).
-    #[error("invalid origin {0:?} (expected scheme://host[:port], e.g. https://example.com)")]
+    /// A web origin is not of the form `http(s)://host[:port]` (clause 14.5).
+    #[error("invalid origin {0:?} (expected http(s)://host[:port], e.g. https://example.com)")]
     InvalidOrigin(String),
 
     /// A binding pattern is not valid (clause 16.3).

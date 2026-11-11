@@ -4,13 +4,12 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use mdns_sd::{ServiceDaemon, ServiceInfo};
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc as tmpsc, watch};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::protocol::{Endpoint, Fields, Hello, Message, Subscribe, Tally, TypeDescriptor};
 use crate::store::{Store, text_shortcuts};
-use crate::wire::{self, Ended, lock};
+use crate::wire::{self, Ended, Incoming, lock};
 use crate::{DEFAULT_PORT, Error, PROGRAM, PROTOCOL_VERSION, Result, SERVICE_TYPE};
 
 /// Settings for a [`Source`].
@@ -105,7 +104,8 @@ struct State {
 struct Connection {
     channels: Vec<String>,
     tally: Tally,
-    out: tmpsc::UnboundedSender<WsMessage>,
+    /// `None` once the receiver fell too far behind; its task then ends the connection.
+    out: Option<tmpsc::Sender<WsMessage>>,
 }
 
 impl Source {
@@ -172,10 +172,10 @@ impl Source {
         let (seq, frame) = state.store.update(channel, type_name, fields)?;
         for conn in state
             .connections
-            .values()
+            .values_mut()
             .filter(|c| c.channels.iter().any(|c| c == channel))
         {
-            let _ = conn.out.send(frame.clone()); // a closed connection is cleaned up by its own task
+            wire::enqueue(&mut conn.out, frame.clone());
         }
         Ok(seq)
     }
@@ -190,8 +190,8 @@ impl Source {
     pub fn announce(&self, types: Vec<TypeDescriptor>) -> Result<()> {
         let mut state = lock(&self.shared.state);
         let frame = state.store.announce(types)?;
-        for conn in state.connections.values() {
-            let _ = conn.out.send(frame.clone());
+        for conn in state.connections.values_mut() {
+            wire::enqueue(&mut conn.out, frame.clone());
         }
         Ok(())
     }
@@ -315,7 +315,12 @@ fn dns_label(name: &str) -> &str {
 }
 
 /// Serves one receiver from WebSocket upgrade to disconnect.
-async fn serve(stream: TcpStream, address: SocketAddr, shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
+async fn serve(incoming: Incoming, shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
+    let Incoming {
+        stream,
+        address,
+        slot,
+    } = incoming;
     let mut peer = match wire::accept(stream, &shared.path, "subscribe").await {
         Ok((peer, _)) => peer,
         Err(Ended(e)) => return tracing::debug!("upgrade from {address} failed: {e}"),
@@ -329,6 +334,7 @@ async fn serve(stream: TcpStream, address: SocketAddr, shared: Arc<Shared>, mut 
     };
     let subscribe = wire::greet(
         &mut peer,
+        &slot,
         hello,
         shared.pairing_code.as_deref(),
         |message| match message {
@@ -369,8 +375,9 @@ async fn serve(stream: TcpStream, address: SocketAddr, shared: Arc<Shared>, mut 
 
 /// Adds the connection and queues the announcement and full state (clause 9.2) under one lock,
 /// so no update is lost or sent twice.
-fn register(shared: &Shared, subscribe: &Subscribe) -> (u64, tmpsc::UnboundedReceiver<WsMessage>) {
-    let (out, out_rx) = tmpsc::unbounded_channel();
+fn register(shared: &Shared, subscribe: &Subscribe) -> (u64, tmpsc::Receiver<WsMessage>) {
+    let (out, out_rx) = wire::queue();
+    let mut out = Some(out);
     let mut state = lock(&shared.state);
     let channels: Vec<String> = subscribe
         .channels
@@ -380,7 +387,7 @@ fn register(shared: &Shared, subscribe: &Subscribe) -> (u64, tmpsc::UnboundedRec
         .filter(|c| state.store.channels().contains(c))
         .collect();
     for frame in state.store.state(&channels) {
-        let _ = out.send(frame);
+        wire::enqueue(&mut out, frame);
     }
     state.next_connection += 1;
     let connection = state.next_connection;

@@ -311,6 +311,18 @@ fn invalid_use_is_refused() {
     config.allowed_origins = vec!["example.com".into()];
     assert!(matches!(Relay::start(config), Err(Error::InvalidOrigin(_))));
 
+    // A relay that listens beyond this computer needs a pairing code (clause 20.2).
+    let mut config = RelayConfig::new("TEST");
+    config.bind = std::net::Ipv4Addr::UNSPECIFIED.into();
+    config.port = 0;
+    config.advertise = false;
+    assert!(matches!(
+        Relay::start(config.clone()),
+        Err(Error::InvalidAddress(_))
+    ));
+    config.pairing_code = Some("2468".into());
+    assert!(Relay::start(config).is_ok());
+
     let taken = relay(None, &[]);
     assert!(matches!(taken.allow_origin("null"), Err(Error::InvalidOrigin(_))));
     assert!(matches!(taken.revoke_origin("x"), Err(Error::InvalidOrigin(_))));

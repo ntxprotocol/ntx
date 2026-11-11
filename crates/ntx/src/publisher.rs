@@ -94,7 +94,7 @@ pub struct Publisher {
 struct State {
     store: Store,
     /// The current connection's queue, once the handshake finished.
-    out: Option<tmpsc::UnboundedSender<WsMessage>>,
+    out: Option<tmpsc::Sender<WsMessage>>,
     /// Some text has not reached the relay yet.
     unsent: bool,
 }
@@ -205,10 +205,10 @@ impl Drop for Publisher {
 
 impl State {
     fn send(&mut self, frame: WsMessage) {
-        match &self.out {
-            // A closed connection is cleaned up by its own task.
-            Some(out) => drop(out.send(frame)),
-            None => self.unsent = true,
+        // Without a connection, or when the relay fell too far behind (which ends the
+        // connection), the text is sent with the whole state on the next connection.
+        if !wire::enqueue(&mut self.out, frame) {
+            self.unsent = true;
         }
     }
 }
@@ -246,14 +246,15 @@ impl Client for Link {
         // The relay starts a new session for every connection (clause 14.4), so send the whole
         // state again, as a source does on connect (clause 9.2). Under one lock, so no update is
         // lost or sent twice.
-        let (out, mut out_rx) = tmpsc::unbounded_channel();
+        let (out, mut out_rx) = wire::queue();
         {
             let mut state = lock(&self.state);
-            for frame in state.store.state(state.store.channels()) {
-                let _ = out.send(frame);
-            }
+            let frames = state.store.state(state.store.channels());
             state.out = Some(out);
             state.unsent = false;
+            for frame in frames {
+                state.send(frame);
+            }
         }
         let _ = self.events.send(PublisherEvent::Connected {
             relay: hello.source,

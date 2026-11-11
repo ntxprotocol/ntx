@@ -250,7 +250,7 @@ fn publish_through_a_relay() {
     publisher.expect("connected to relay");
     publisher.line("Welcome");
     publisher.expect("sent seq 1");
-    let source = relay.expect_port("served on port ");
+    let source = relay.expect_port("at ws://");
     let receiver = recv(&source, 2, &["--field", "text", "--on-air"]);
     publisher.expect("tally: on air true");
     publisher.line("Amazing grace");

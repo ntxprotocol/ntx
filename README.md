@@ -65,6 +65,15 @@ cargo run -p ntx-cli -- relay --allow-origin https://example.com
 cargo run -p ntx-cli -- publish --name "Song Board"
 ```
 
+Each published source gets a port of its own, not the relay's: the relay prints it
+(`serving "PC (Song Board)" at ws://127.0.0.1:50670/`), and `ntx list` shows it too. Receive it
+with `recv 127.0.0.1:<port>`; `recv 127.0.0.1` would reach the relay's port, which only takes
+publishers.
+
+`ntx relay` and `ntx send` both use port 7686 by default (spec clauses 5.6 and 14.1), so only one
+of them can run on a computer at a time. To run both, give `send` another port, for example
+`send --port 7687`.
+
 Web pages may publish only from origins allowed with `--allow-origin` (never from the origin
 `null`). Programs that send no `Origin` header may publish only from the same computer. Publishing
 is off unless a relay runs.

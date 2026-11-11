@@ -1,15 +1,14 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc as tmpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::protocol::{Endpoint, ErrorCode, Hello, Message, Publish, Tally};
 use crate::source::Mdns;
-use crate::wire::{self, Ended, Peer, lock};
+use crate::wire::{self, Ended, Incoming, Peer, lock};
 use crate::{DEFAULT_PORT, Error, PROGRAM, PROTOCOL_VERSION, Result, Source, SourceConfig, display_name};
 
 /// Most publishers a relay serves at once.
@@ -20,6 +19,12 @@ const MAX_PUBLISHERS_PER_ORIGIN: usize = 8;
 
 /// Most source ids whose port the relay remembers (clause 14.4).
 const MAX_REMEMBERED_PORTS: usize = 256;
+
+/// Most origins the app is asked about and has not answered yet (clause 14.5).
+const MAX_PENDING_REQUESTS: usize = 8;
+
+/// Least time between two questions to the app about origins.
+const REQUEST_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Settings for a [`Relay`].
 #[derive(Debug, Clone)]
@@ -116,8 +121,7 @@ struct Shared {
     mdns: Option<Arc<Mdns>>,
     /// Allowed origins, normalised. Connections watch it, so withdrawing an origin closes them.
     allowed: watch::Sender<HashSet<String>>,
-    /// Origins already reported with [`RelayEvent::OriginRequested`].
-    requested: Mutex<HashSet<String>>,
+    requests: Mutex<Requests>,
     state: Mutex<State>,
     events: mpsc::Sender<RelayEvent>,
 }
@@ -144,8 +148,16 @@ impl Relay {
     ///
     /// # Errors
     ///
-    /// Fails if an allowed origin is invalid, the port cannot be opened, or mDNS cannot start.
+    /// Fails if an allowed origin is invalid, `bind` is not a loopback address but there is no
+    /// pairing code, the port cannot be opened, or mDNS cannot start.
     pub fn start(config: RelayConfig) -> Result<Relay> {
+        // Beyond this computer, anyone can send any Origin header (clause 20.2).
+        if !config.bind.to_canonical().is_loopback() && config.pairing_code.is_none() {
+            return Err(Error::InvalidAddress(format!(
+                "{}: a relay that listens beyond this computer needs a pairing code",
+                config.bind
+            )));
+        }
         let allowed = config
             .allowed_origins
             .iter()
@@ -163,7 +175,7 @@ impl Relay {
             pairing_code: config.pairing_code,
             mdns,
             allowed: watch::channel(allowed).0,
-            requested: Mutex::default(),
+            requests: Mutex::default(),
             state: Mutex::default(),
             events: events_tx,
         });
@@ -180,9 +192,10 @@ impl Relay {
     ///
     /// # Errors
     ///
-    /// Fails if `origin` is not of the form `scheme://host[:port]`.
+    /// Fails if `origin` is not of the form `http(s)://host[:port]`.
     pub fn allow_origin(&self, origin: &str) -> Result<()> {
         let origin = normalize_origin(origin)?;
+        lock(&self.shared.requests).pending.remove(&origin);
         self.shared.allowed.send_modify(|allowed| {
             allowed.insert(origin);
         });
@@ -190,13 +203,15 @@ impl Relay {
     }
 
     /// Withdraws permission from `origin`. Its publishers receive `not_allowed` and are
-    /// disconnected (clause 14.5).
+    /// disconnected (clause 14.5). Also call it when the user says no to an
+    /// [`RelayEvent::OriginRequested`], so that it no longer counts as unanswered.
     ///
     /// # Errors
     ///
-    /// Fails if `origin` is not of the form `scheme://host[:port]`.
+    /// Fails if `origin` is not of the form `http(s)://host[:port]`.
     pub fn revoke_origin(&self, origin: &str) -> Result<()> {
         let origin = normalize_origin(origin)?;
+        lock(&self.shared.requests).pending.remove(&origin);
         self.shared.allowed.send_modify(|allowed| {
             allowed.remove(&origin);
         });
@@ -226,6 +241,28 @@ impl Drop for Relay {
     }
 }
 
+/// The origins the app was asked about and has not answered, and when it was last asked.
+#[derive(Default)]
+struct Requests {
+    pending: HashSet<String>,
+    last: Option<Instant>,
+}
+
+impl Requests {
+    /// Whether to ask the app about `origin` now: once per origin, with few questions waiting and
+    /// not too often, so that pages cannot flood the user.
+    fn ask(&mut self, origin: &str) -> bool {
+        let ask = !self.pending.contains(origin)
+            && self.pending.len() < MAX_PENDING_REQUESTS
+            && self.last.is_none_or(|last| last.elapsed() >= REQUEST_INTERVAL);
+        if ask {
+            self.pending.insert(origin.to_string());
+            self.last = Some(Instant::now());
+        }
+        ask
+    }
+}
+
 /// Whether a connection may publish, decided before `hello` (clause 14.5).
 #[derive(Debug, PartialEq)]
 enum Admission {
@@ -252,16 +289,13 @@ fn admit(origin: Option<&str>, address: IpAddr, allowed: &HashSet<String>) -> Ad
     }
 }
 
-/// Normalises a web origin, `scheme://host[:port]`, for comparison: lowercase, without a
-/// trailing slash or the scheme's default port.
+/// Normalises a web origin, `http(s)://host[:port]`, for comparison: lowercase, without a
+/// trailing slash or the scheme's default port. Other schemes cannot be allowed.
 fn normalize_origin(origin: &str) -> Result<String> {
     let invalid = || Error::InvalidOrigin(origin.to_string());
     let (scheme, rest) = origin.trim().split_once("://").ok_or_else(invalid)?;
     let rest = rest.strip_suffix('/').unwrap_or(rest);
-    let scheme_ok = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-        && scheme
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c));
+    let scheme_ok = scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https");
     if !scheme_ok || rest.contains(['/', '?', '#', '@']) || rest.contains(char::is_whitespace) {
         return Err(invalid());
     }
@@ -275,10 +309,7 @@ fn normalize_origin(origin: &str) -> Result<String> {
     if host.is_empty() {
         return Err(invalid());
     }
-    let default_port = matches!(
-        (scheme.as_str(), port),
-        ("http" | "ws", Some(80)) | ("https" | "wss", Some(443))
-    );
+    let default_port = matches!((scheme.as_str(), port), ("http", Some(80)) | ("https", Some(443)));
     Ok(match port {
         Some(port) if !default_port => format!("{scheme}://{host}:{port}"),
         _ => format!("{scheme}://{host}"),
@@ -295,7 +326,12 @@ where
 }
 
 /// Serves one publisher from WebSocket upgrade to disconnect.
-async fn serve(stream: TcpStream, address: SocketAddr, shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
+async fn serve(incoming: Incoming, shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
+    let Incoming {
+        stream,
+        address,
+        slot,
+    } = incoming;
     let (mut peer, origin) = match wire::accept(stream, &shared.path, "publish").await {
         Ok(accepted) => accepted,
         Err(Ended(e)) => return tracing::debug!("upgrade from {address} failed: {e}"),
@@ -304,7 +340,7 @@ async fn serve(stream: TcpStream, address: SocketAddr, shared: Arc<Shared>, mut 
     let origin = match admission {
         Admission::Allowed(origin) => origin,
         Admission::Ask(origin) => {
-            if lock(&shared.requested).insert(origin.clone()) {
+            if lock(&shared.requests).ask(&origin) {
                 let _ = shared.events.send(RelayEvent::OriginRequested {
                     origin: origin.clone(),
                 });
@@ -323,6 +359,7 @@ async fn serve(stream: TcpStream, address: SocketAddr, shared: Arc<Shared>, mut 
     };
     let publish = wire::greet(
         &mut peer,
+        &slot,
         hello,
         shared.pairing_code.as_deref(),
         |message| match message {
@@ -356,7 +393,7 @@ async fn serve(stream: TcpStream, address: SocketAddr, shared: Arc<Shared>, mut 
         port: source.local_addr().port(),
     });
 
-    let (out, mut out_rx) = tmpsc::unbounded_channel();
+    let (out, mut out_rx) = wire::queue();
     tokio::spawn(forward_tally(source.tally(), out.clone()));
     let mut allowed = shared.allowed.subscribe();
     let stopped = async move {
@@ -379,7 +416,7 @@ async fn serve(stream: TcpStream, address: SocketAddr, shared: Arc<Shared>, mut 
             _ => Ok(()),
         };
         if let Err(e) = forwarded {
-            let _ = out.send(WsMessage::text(Message::Error(wire::bad_message(&e)).to_json()));
+            let _ = out.try_send(WsMessage::text(Message::Error(wire::bad_message(&e)).to_json()));
         }
     })
     .await;
@@ -486,10 +523,10 @@ async fn start_source(shared: &Shared, publish: Publish) -> Result<Source> {
 }
 
 /// Sends the combined tally to the publisher whenever it changes (clause 14.3).
-async fn forward_tally(mut tally: watch::Receiver<Tally>, out: tmpsc::UnboundedSender<WsMessage>) {
+async fn forward_tally(mut tally: watch::Receiver<Tally>, out: tmpsc::Sender<WsMessage>) {
     while tally.changed().await.is_ok() {
         let message = Message::Tally(*tally.borrow_and_update());
-        if out.send(WsMessage::text(message.to_json())).is_err() {
+        if out.send(WsMessage::text(message.to_json())).await.is_err() {
             return;
         }
     }
@@ -508,7 +545,6 @@ mod tests {
             ("https://example.com:8443", "https://example.com:8443"),
             ("http://[::1]:3000", "http://[::1]:3000"),
             ("http://[::1]", "http://[::1]"),
-            ("chrome-extension://abcdef", "chrome-extension://abcdef"),
         ] {
             assert_eq!(normalize_origin(given).unwrap(), normal, "{given}");
         }
@@ -520,12 +556,30 @@ mod tests {
             "https://a:x",
             "1http://a",
             "https://a b",
+            "chrome-extension://abcdef",
+            "file://x",
         ] {
             assert!(
                 matches!(normalize_origin(bad), Err(Error::InvalidOrigin(_))),
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn questions_to_the_app_are_limited() {
+        let mut requests = Requests::default();
+        assert!(requests.ask("https://a.example"));
+        assert!(!requests.ask("https://a.example"), "asked twice");
+        assert!(!requests.ask("https://b.example"), "asked too soon");
+        for i in 0..MAX_PENDING_REQUESTS {
+            requests.last = None;
+            requests.ask(&format!("https://{i}.example"));
+        }
+        requests.last = None;
+        assert!(!requests.ask("https://z.example"), "too many unanswered");
+        requests.pending.remove("https://a.example");
+        assert!(requests.ask("https://z.example"));
     }
 
     #[test]

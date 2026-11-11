@@ -810,7 +810,7 @@ pub unsafe extern "C" fn ntx_relay_start(config_json: *const c_char, out: *mut *
 
 /// Allows web pages from `origin` (e.g. `"https://example.com"`) to publish. Call it when the
 /// user agrees to an `origin_requested` event. Fails for an origin that is not
-/// `scheme://host[:port]`.
+/// `http(s)://host[:port]`.
 ///
 /// # Safety
 ///
@@ -827,7 +827,7 @@ pub unsafe extern "C" fn ntx_relay_allow_origin(relay: *const NtxRelay, origin: 
 }
 
 /// Withdraws permission from `origin`; its publishers receive `not_allowed` and are
-/// disconnected. Fails for an origin that is not `scheme://host[:port]`.
+/// disconnected. Fails for an origin that is not `http(s)://host[:port]`.
 ///
 /// # Safety
 ///
