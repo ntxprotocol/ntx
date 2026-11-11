@@ -200,10 +200,20 @@ fn list_finds_an_advertised_sender() {
         .output()
         .unwrap();
     assert!(output.status.success());
+    // Lines look like "<name>  <url>  NTX <version>  id <id>". Long host names (as on CI) can
+    // push "surface test" past the 63-byte cut, so check the id and the shortened name.
+    let host = gethostname::gethostname().to_string_lossy().into_owned();
+    let machine = host.split('.').next().unwrap_or(&host).to_uppercase();
+    let full_name = format!("{machine} ({name})");
+    let listed = stdout(&output)
+        .into_iter()
+        .find(|l| l.ends_with("id surface-list"));
+    let shown = listed
+        .as_deref()
+        .and_then(|l| l.split("  ws://").next())
+        .unwrap_or_default();
     assert!(
-        stdout(&output)
-            .iter()
-            .any(|l| l.contains("surface test") && l.contains("id surface-list")),
+        shown.len() <= 63 && !shown.is_empty() && full_name.starts_with(shown),
         "{output:?}"
     );
     assert!(sender.finish().success());
