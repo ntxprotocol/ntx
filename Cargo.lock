@@ -487,6 +487,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ntx-ffi"
+version = "0.1.0"
+dependencies = [
+ "ntx",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

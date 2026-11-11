@@ -53,6 +53,12 @@ repos:
         entry: cargo clippy --workspace --all-targets --locked -- -D warnings
         types_or: [rust, toml]
         pass_filenames: false
+      - id: c-header-up-to-date
+        name: include/ntx.h matches the C ABI (cbindgen)
+        language: system
+        entry: sh -c 'cd crates/ntx-ffi && cbindgen --config cbindgen.toml --verify --output include/ntx.h'
+        files: ^crates/ntx-ffi/
+        pass_filenames: false
       - id: tests-and-coverage
         name: tests incl. surface tests, line coverage >= 90%
         language: system

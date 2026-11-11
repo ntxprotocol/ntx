@@ -8,7 +8,7 @@ use mdns_sd::{ServiceDaemon, ServiceEvent};
 use crate::{Error, Result, SERVICE_TYPE};
 
 /// A source found on the network (clause 6).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct DiscoveredSource {
     /// The source id from the TXT record.
     pub id: String,
@@ -29,7 +29,10 @@ pub struct DiscoveredSource {
 }
 
 /// Something a [`Browser`] noticed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serialises as `{"event": "found", "data": {...}}`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub enum BrowserEvent {
     /// A new source, or a change of URL, name, version or pairing for a source already found.
     Found(DiscoveredSource),

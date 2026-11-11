@@ -46,7 +46,10 @@ impl ReceiverConfig {
 }
 
 /// Something that happened to a [`Receiver`].
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Serialises as `{"event": "update", "data": {...}}`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub enum ReceiverEvent {
     /// The handshake finished. Updates with the full state follow.
     Connected {

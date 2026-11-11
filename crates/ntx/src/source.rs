@@ -61,7 +61,10 @@ impl SourceConfig {
 }
 
 /// Something that happened to a [`Source`].
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Serialises as `{"event": "receiver_connected", "data": {...}}`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub enum SourceEvent {
     /// A receiver finished the handshake.
     ReceiverConnected {

@@ -19,9 +19,9 @@ sending text, not video, between apps on a local network.
 | --- | --- |
 | [`crates/ntx`](crates/ntx) | Rust library: sources, receivers, mDNS discovery, pairing, binding |
 | [`crates/ntx-cli`](crates/ntx-cli) | `ntx` command: a test sender and receiver |
+| [`crates/ntx-ffi`](crates/ntx-ffi) | C library (`libntx_ffi`) and header [`ntx.h`](crates/ntx-ffi/include/ntx.h) |
 
-Planned in this repository: a C ABI (`ntx-sys`) and thin wrappers for C/C++, Python, Node, Java
-and .NET, all built on this one core.
+Planned in this repository: thin wrappers for Python, Node, Java and .NET on top of the C library.
 
 ## Try it
 
@@ -75,7 +75,7 @@ Python, Node, Java and .NET.
 All checks run automatically before each commit and push, and again in CI. Set up once:
 
 ```bash
-brew install pre-commit cargo-llvm-cov cargo-deny   # or your platform's equivalent
+brew install pre-commit cargo-llvm-cov cargo-deny cbindgen   # or your platform's equivalent
 cargo install cargo-machete
 pre-commit install
 ```

@@ -1,0 +1,25 @@
+[package]
+name = "ntx-ffi"
+description = "C ABI for NTX (Network Text Exchange), used by the C/C++, Python, Node, Java and .NET bindings"
+keywords = ["ntx", "ffi", "text", "protocol", "broadcast"]
+categories = ["network-programming", "external-ffi-bindings"]
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lib]
+name = "ntx_ffi"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+ntx = { version = "0.1.0", path = "../ntx" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+
+[lints]
+workspace = true

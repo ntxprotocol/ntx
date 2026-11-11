@@ -14,3 +14,6 @@ All notable changes are listed here. The format follows
 - `ntx` command-line tool: `ntx send`, `ntx recv`, `ntx list`.
 - Surface tests for the CLI and raw-protocol tests; line coverage at least 90%, enforced.
 - pre-commit / pre-push hooks and CI running the same checks.
+- `ntx-ffi`: C ABI (opaque handles, JSON settings and events, polling), `ntx.h` header generated
+  by cbindgen, and a C example that is compiled and run by the tests.
+- Events serialise to JSON (`{"event": ..., "data": ...}`).
