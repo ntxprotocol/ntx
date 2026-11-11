@@ -77,6 +77,8 @@ def test_closed_objects_raise() -> None:
 def test_invalid_arguments(source: ntx.Source) -> None:
     with pytest.raises(ValueError, match="timeout"):
         source.wait_event(-1)
+    with pytest.raises(ValueError, match="timeout"):
+        source.wait_event(math.nan)
     with pytest.raises(ValueError, match="Out of range float"):
         source.update("program", "com.example.number", {"value": math.nan})
     with pytest.raises(ValueError, match="fields"):
@@ -85,3 +87,11 @@ def test_invalid_arguments(source: ntx.Source) -> None:
         source._source.update("program", "com.example.list", "[]")
     with pytest.raises(ValueError, match="types"):
         source._source.announce("{}")
+
+
+def test_channels_must_not_be_a_str() -> None:
+    with pytest.raises(TypeError, match="not a str"):
+        local_source(channels="program")
+    with local_source() as source:
+        with pytest.raises(TypeError, match="not a str"):
+            receiver_for(source, channels="program")

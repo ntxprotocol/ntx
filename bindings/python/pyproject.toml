@@ -32,7 +32,8 @@ Specification = "https://github.com/ntxprotocol/spec"
 [tool.maturin]
 python-source = "python"
 module-name = "ntxprotocol._ntx"
-locked = true
+# Not `locked`: an sdist holds only the crates this package needs, so cargo must trim
+# Cargo.lock. CI builds the wheels with `--locked`.
 
 [tool.ruff]
 line-length = 110

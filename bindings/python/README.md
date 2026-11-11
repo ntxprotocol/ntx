@@ -60,8 +60,9 @@ with ntx.Browser() as browser:
 | --- | --- |
 | Objects | `Source`, `Receiver`, `Browser`. Close them with `close()` or a `with` block |
 | Settings | Keyword arguments, e.g. `Source(name, port=0, pairing_code="1234", advertise=False)` |
-| Events | Frozen dataclasses, read with `poll_event()` or `wait_event(timeout)`. No callbacks |
-| Threads | Waiting releases the GIL, so other threads keep running. Objects may be shared |
+| Channels | A sequence of names, e.g. `channels=("program", "preview")`. A single `str` raises `TypeError` |
+| Events | Frozen dataclasses, read with `poll_event()` or `wait_event(timeout)` (`math.inf` waits with no limit). No callbacks |
+| Threads | Waiting releases the GIL and Ctrl-C interrupts it. Objects may be shared; `close()` from another thread ends a wait with `ClosedError` |
 | Errors | Exceptions derived from `NtxError`, e.g. `UnknownChannelError`, `ClosedError` |
 | Binding | `render(fields, "{reference} · {version}")` turns fields into text (clause 16) |
 
@@ -83,15 +84,16 @@ From the repository root:
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
-pip install maturin pytest pytest-cov
+pip install maturin mypy pytest pytest-cov
 cd bindings/python
 maturin develop
 pytest
 ```
 
-`./coverage.sh` runs the tests against an instrumented build and checks that both the Python
-package and the Rust binding code ([`src/lib.rs`](src/lib.rs)) have at least 90% line coverage.
-It needs [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov). The pre-push hook runs it.
+`./check.sh` checks the type stub against the built module (`mypy.stubtest`), runs the tests
+against an instrumented build and checks that both the Python package and the Rust binding code
+([`src/lib.rs`](src/lib.rs)) have at least 90% line coverage. It needs mypy and
+[`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov). The pre-push hook runs it.
 
 ## Licence
 

@@ -32,6 +32,13 @@ def _json(value: object) -> str:
     return json.dumps(value, allow_nan=False)
 
 
+def _channels(channels: Sequence[str]) -> list[str]:
+    # A plain string is a sequence too, but of single characters.
+    if isinstance(channels, str):
+        raise TypeError(f"channels must be a sequence of names, not a str: use ({channels!r},)")
+    return list(channels)
+
+
 class _Handle(Generic[E]):
     """What sources, receivers and browsers share: events and closing."""
 
@@ -48,10 +55,14 @@ class _Handle(Generic[E]):
         return self.wait_event(0)
 
     def wait_event(self, timeout: float) -> E | None:
-        """Waits for the next event. Other Python threads keep running while it waits.
+        """Waits for the next event.
+
+        Other Python threads keep running while it waits, Ctrl-C interrupts it, and
+        :meth:`close` from another thread ends it with :class:`ClosedError`.
 
         Args:
-            timeout: Longest wait in seconds.
+            timeout: Longest wait in seconds. ``0`` just checks; ``math.inf`` waits until an
+                event comes.
 
         Returns:
             The event, or ``None`` if none came in time.
@@ -63,7 +74,10 @@ class _Handle(Generic[E]):
         return self._events[event["event"]](event["data"])
 
     def close(self) -> None:
-        """Stops the object. Later calls raise :class:`ClosedError`. Closing twice is fine."""
+        """Stops the object. Later calls raise :class:`ClosedError`. Closing twice is fine.
+
+        Safe to call from another thread while one waits: it returns within about 50 ms.
+        """
         self._native.close()
 
     def __enter__(self: H) -> H:
@@ -87,7 +101,8 @@ class Source(_Handle[SourceEvent]):
         name: Human-readable name, e.g. ``CHURCH-PC (Lyrics)``.
         id: Stable id. Save it and pass it again next time, so receivers find the source after a
             restart. Defaults to a new random UUID.
-        channels: Channels this source has. Must include ``program``.
+        channels: Channels this source has, e.g. ``("program", "preview")``. Must include
+            ``program``.
         bind: Address to listen on. Defaults to all IPv4 interfaces.
         port: TCP port. ``0`` picks any free port.
         path: WebSocket path.
@@ -95,6 +110,7 @@ class Source(_Handle[SourceEvent]):
         advertise: Advertise with mDNS.
 
     Raises:
+        TypeError: ``channels`` is a single ``str``.
         UnknownChannelError: ``channels`` lacks ``program``.
         InvalidAddressError: ``bind`` is not an IP address.
         NetworkError: The port cannot be opened.
@@ -116,7 +132,7 @@ class Source(_Handle[SourceEvent]):
         self._source = _ntx.Source(
             name,
             id=id,
-            channels=list(channels),
+            channels=_channels(channels),
             bind=bind,
             port=port,
             path=path,
@@ -203,6 +219,7 @@ class Receiver(_Handle[ReceiverEvent]):
         reconnect: Reconnect automatically after the connection is lost.
 
     Raises:
+        TypeError: ``channels`` is a single ``str``.
         InvalidAddressError: ``address`` is not a valid address.
     """
 
@@ -220,7 +237,7 @@ class Receiver(_Handle[ReceiverEvent]):
             address,
             name,
             id=id,
-            channels=list(channels),
+            channels=_channels(channels),
             pairing_code=pairing_code,
             reconnect=reconnect,
         )

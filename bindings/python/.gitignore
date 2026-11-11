@@ -3,3 +3,5 @@
 /python/ntxprotocol/*.pyd
 __pycache__/
 .coverage
+*.profraw
+.venv/

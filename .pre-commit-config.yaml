@@ -108,10 +108,10 @@ repos:
   - repo: local
     hooks:
       - id: python-tests-and-coverage
-        name: Python tests incl. surface tests, Python and Rust binding coverage >= 90%
+        name: Python stubtest and tests incl. surface tests, Python and Rust binding coverage >= 90%
         language: python
-        additional_dependencies: [maturin==1.16.0, pytest==8.4.2, pytest-cov==7.1.0]
-        entry: bindings/python/coverage.sh
+        additional_dependencies: [maturin==1.16.0, mypy==2.4.1, pytest==8.4.2, pytest-cov==7.1.0]
+        entry: bindings/python/check.sh
         pass_filenames: false
         always_run: true
         stages: [pre-push]

@@ -8,8 +8,9 @@
 //! - `close()` stops the object at once; later calls raise `ClosedError`.
 
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{PoisonError, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ntx::{Browser, Fields, Receiver, ReceiverConfig, Source, SourceConfig, Tally, TypeDescriptor};
 use pyo3::create_exception;
@@ -64,40 +65,75 @@ fn from_json<T: DeserializeOwned>(json: &str, what: &str) -> PyResult<T> {
     serde_json::from_str(json).map_err(|e| PyValueError::new_err(format!("{what}: {e}")))
 }
 
+/// How long one slice of a wait lasts. Between slices `close()` can take the object and
+/// Ctrl-C can interrupt the wait.
+const SLICE: Duration = Duration::from_millis(50);
+
 /// A native object that `close()` can stop while another thread waits on it.
-struct Handle<T>(RwLock<Option<T>>);
+///
+/// Waits hold the read lock for one [`SLICE`] at a time, so `close()` (which sets `closed` and
+/// then takes the write lock) returns within one slice and the waiter then gets `ClosedError`.
+struct Handle<T> {
+    object: RwLock<Option<T>>,
+    closed: AtomicBool,
+}
 
 impl<T: Send + Sync> Handle<T> {
     fn new(value: T) -> Self {
-        Handle(RwLock::new(Some(value)))
+        Handle {
+            object: RwLock::new(Some(value)),
+            closed: AtomicBool::new(false),
+        }
     }
 
     /// Runs `body` on the object with the GIL released.
     fn with<R: Send>(&self, py: Python<'_>, body: impl FnOnce(&T) -> ntx::Result<R> + Send) -> PyResult<R> {
         py.detach(|| {
-            let guard = self.0.read().unwrap_or_else(PoisonError::into_inner);
+            if self.closed.load(Ordering::Acquire) {
+                return None;
+            }
+            let guard = self.object.read().unwrap_or_else(PoisonError::into_inner);
             guard.as_ref().map(body)
         })
         .ok_or_else(|| ClosedError::new_err("closed"))?
         .map_err(error)
     }
 
-    /// Waits up to `timeout` seconds (0 = just check) for the next event, as JSON.
+    /// Waits up to `timeout` seconds (0 = just check, infinity = no limit) for the next event,
+    /// as JSON. Waits in slices, checking for Ctrl-C and `close()` between them.
     fn wait_event<E: Serialize + Send>(
         &self,
         py: Python<'_>,
         timeout: f64,
-        wait: impl FnOnce(&T, Duration) -> Option<E> + Send,
+        wait: impl Fn(&T, Duration) -> Option<E> + Sync,
     ) -> PyResult<Option<String>> {
-        let timeout = Duration::try_from_secs_f64(timeout)
-            .map_err(|e| PyValueError::new_err(format!("timeout: {e}")))?;
-        let event = self.with(py, |object| Ok(wait(object, timeout)))?;
-        Ok(event.map(|e| serde_json::to_string(&e).expect("NTX events always serialise")))
+        // No deadline means wait forever: for infinity, and for timeouts too large for `Instant`.
+        let deadline = if timeout == f64::INFINITY {
+            None
+        } else {
+            let timeout = Duration::try_from_secs_f64(timeout)
+                .map_err(|e| PyValueError::new_err(format!("timeout: {e}")))?;
+            Instant::now().checked_add(timeout)
+        };
+        loop {
+            let slice = deadline.map_or(SLICE, |d| d.saturating_duration_since(Instant::now()).min(SLICE));
+            if let Some(event) = self.with(py, |object| Ok(wait(object, slice)))? {
+                return Ok(Some(
+                    serde_json::to_string(&event).expect("NTX events always serialise"),
+                ));
+            }
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                return Ok(None);
+            }
+            py.check_signals()?;
+        }
     }
 
-    /// Stops the object. Stopping mDNS can take a moment, so the GIL is released.
+    /// Stops the object, at most one [`SLICE`] after a waiting thread's current slice began.
+    /// Stopping mDNS can take a moment, so the GIL is released.
     fn close(&self, py: Python<'_>) {
-        py.detach(|| drop(self.0.write().unwrap_or_else(PoisonError::into_inner).take()));
+        self.closed.store(true, Ordering::Release);
+        py.detach(|| drop(self.object.write().unwrap_or_else(PoisonError::into_inner).take()));
     }
 }
 

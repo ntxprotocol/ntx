@@ -55,21 +55,26 @@ jobs:
       - run: python -m pip install ./bindings/python pytest==8.4.2
       - run: python -m pytest
         working-directory: bindings/python
+      - name: The type stub matches the built module
+        if: matrix.python == '3.13'
+        run: |
+          python -m pip install mypy==2.4.1
+          python -m mypy.stubtest ntxprotocol._ntx
 
   # abi3 wheels (one per platform, for Python 3.9+) for x64 and arm64. Kept as build artifacts;
-  # nothing is published.
+  # nothing is published. Wheels built for the runner's own CPU are installed and imported.
   wheels:
     name: wheel (${{ matrix.os }}, ${{ matrix.target }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, target: x86_64 }
-          - { os: ubuntu-latest, target: aarch64 }
-          - { os: macos-latest, target: x86_64 }
-          - { os: macos-latest, target: aarch64 }
-          - { os: windows-latest, target: x64 }
-          - { os: windows-latest, target: aarch64 }
+          - { os: ubuntu-latest, target: x86_64, native: true }
+          - { os: ubuntu-24.04-arm, target: aarch64, native: true }
+          - { os: macos-latest, target: x86_64, native: false }
+          - { os: macos-latest, target: aarch64, native: true }
+          - { os: windows-latest, target: x64, native: true }
+          - { os: windows-latest, target: aarch64, native: false }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -78,11 +83,44 @@ jobs:
           working-directory: bindings/python
           target: ${{ matrix.target }}
           manylinux: auto
-          args: --release --out dist
+          args: --release --locked --out dist
+      - uses: actions/setup-python@v5
+        if: matrix.native
+        with:
+          python-version: "3.13"
+      - name: Install the wheel and import it
+        if: matrix.native
+        shell: bash
+        run: |
+          python -m pip install --no-index --find-links bindings/python/dist ntx-protocol
+          python -I -c "import ntxprotocol as ntx; assert ntx.render({'a': 'b'}, '{a}') == 'b'"
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-${{ matrix.os }}-${{ matrix.target }}
           path: bindings/python/dist/*.whl
+
+  # The source distribution, built and then installed from source (which compiles the Rust code).
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: bindings/python
+          command: sdist
+          args: --out dist
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install the sdist and import it
+        run: |
+          python -m pip install bindings/python/dist/*.tar.gz
+          python -I -c "import ntxprotocol as ntx; assert ntx.render({'a': 'b'}, '{a}') == 'b'"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: bindings/python/dist/*.tar.gz
 
   # The same checks as the local pre-commit and pre-push hooks: format, lint, coverage >= 90%,
   # docs, licences and advisories, unused dependencies, duplicated code, secrets.

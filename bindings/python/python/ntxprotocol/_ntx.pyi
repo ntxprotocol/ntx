@@ -1,5 +1,29 @@
 """Native module (Rust, PyO3). Use the typed wrappers in :mod:`ntxprotocol` instead."""
 
+from typing import final
+
+__all__ = [
+    "DEFAULT_PORT",
+    "PREVIEW",
+    "PROGRAM",
+    "PROTOCOL_VERSION",
+    "Browser",
+    "ClosedError",
+    "InvalidAddressError",
+    "InvalidMessageError",
+    "InvalidPatternError",
+    "InvalidTypeNameError",
+    "MdnsError",
+    "MessageTooLargeError",
+    "NetworkError",
+    "NtxError",
+    "Receiver",
+    "Source",
+    "UnknownChannelError",
+    "__version__",
+    "render",
+]
+
 __version__: str
 PROTOCOL_VERSION: str
 DEFAULT_PORT: int
@@ -38,9 +62,10 @@ class InvalidMessageError(NtxError):
 
 def render(fields_json: str, pattern: str) -> str: ...
 
+@final
 class Source:
-    def __init__(
-        self,
+    def __new__(
+        cls,
         name: str,
         *,
         id: str | None,
@@ -50,7 +75,7 @@ class Source:
         path: str,
         pairing_code: str | None,
         advertise: bool,
-    ) -> None: ...
+    ) -> Source: ...
     def update(self, channel: str, type_name: str, fields_json: str) -> int: ...
     def update_text(self, channel: str, text: str) -> int: ...
     def clear(self, channel: str) -> int: ...
@@ -68,9 +93,10 @@ class Source:
     @property
     def receiver_count(self) -> int: ...
 
+@final
 class Receiver:
-    def __init__(
-        self,
+    def __new__(
+        cls,
         address: str,
         name: str,
         *,
@@ -78,13 +104,15 @@ class Receiver:
         channels: list[str],
         pairing_code: str | None,
         reconnect: bool,
-    ) -> None: ...
+    ) -> Receiver: ...
     def set_tally(self, program: bool, preview: bool) -> None: ...
     def wait_event(self, timeout: float) -> str | None: ...
     def close(self) -> None: ...
     @property
     def url(self) -> str: ...
 
+@final
 class Browser:
+    def __new__(cls) -> Browser: ...
     def wait_event(self, timeout: float) -> str | None: ...
     def close(self) -> None: ...
