@@ -25,8 +25,8 @@ sending text, not video, between apps on a local network.
 
 | Crate | What it is |
 | --- | --- |
-| [`crates/ntx`](crates/ntx) | Rust library: sources, receivers, mDNS discovery, pairing, binding |
-| [`crates/ntx-cli`](crates/ntx-cli) | `ntx` command: a test sender and receiver |
+| [`crates/ntx`](crates/ntx) | Rust library: sources, receivers, publishers, relays, mDNS discovery, pairing, binding |
+| [`crates/ntx-cli`](crates/ntx-cli) | `ntx` command: a test sender, receiver, publisher and relay |
 | [`crates/ntx-ffi`](crates/ntx-ffi) | C library (`libntx_ffi`) and header [`ntx.h`](crates/ntx-ffi/include/ntx.h) |
 
 Planned in this repository: thin wrappers for Python, Node, Java and .NET on top of the C library.
@@ -55,6 +55,28 @@ cargo run -p ntx-cli -- recv 127.0.0.1 --field text
 
 Useful options: `--pair 1234` (pairing code), `--preview` (also offer a preview channel),
 `--json --type com.example.lyrics` (send JSON fields), `--pattern "{reference} · {version}"`.
+
+Programs that cannot accept connections, such as web pages, publish through a relay
+([spec clause 14](https://github.com/ntxprotocol/spec)). Run a relay, then publish to it; the relay
+serves the text to the network as an ordinary source:
+
+```bash
+cargo run -p ntx-cli -- relay --allow-origin https://example.com
+cargo run -p ntx-cli -- publish --name "Song Board"
+```
+
+Each published source gets a port of its own, not the relay's: the relay prints it
+(`serving "PC (Song Board)" at ws://127.0.0.1:50670/`), and `ntx list` shows it too. Receive it
+with `recv 127.0.0.1:<port>`; `recv 127.0.0.1` would reach the relay's port, which only takes
+publishers.
+
+`ntx relay` and `ntx send` both use port 7686 by default (spec clauses 5.6 and 14.1), so only one
+of them can run on a computer at a time. To run both, give `send` another port, for example
+`send --port 7687`.
+
+Web pages may publish only from origins allowed with `--allow-origin` (never from the origin
+`null`). Programs that send no `Origin` header may publish only from the same computer. Publishing
+is off unless a relay runs.
 
 ## Use the library
 

@@ -1,4 +1,4 @@
-//! `ntx`: a small test sender and receiver for NTX.
+//! `ntx`: a small test sender, receiver, publisher and relay for NTX.
 
 use std::error::Error;
 use std::io::BufRead;
@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use clap::{Args, Parser, Subcommand};
 use ntx::binding::{Pattern, field_text};
 use ntx::{
-    Browser, BrowserEvent, Fields, Receiver, ReceiverConfig, ReceiverEvent, Source, SourceConfig,
-    SourceEvent, Tally,
+    Browser, BrowserEvent, Fields, Publisher, PublisherConfig, PublisherEvent, Receiver, ReceiverConfig,
+    ReceiverEvent, Relay, RelayConfig, RelayEvent, Source, SourceConfig, SourceEvent, Tally, display_name,
 };
 
 type CliResult = Result<(), Box<dyn Error>>;
@@ -37,6 +37,16 @@ enum Command {
     Recv(RecvArgs),
     /// List sources found on the network with mDNS.
     List(ListArgs),
+    /// Send each line read from standard input through a relay, like `send`.
+    ///
+    /// The relay serves the text to the network as a source. Use this where a source cannot
+    /// accept connections. The publisher stops at the end of the input.
+    Publish(PublishArgs),
+    /// Run a relay: serve publishers to the network as sources.
+    ///
+    /// Web pages may publish only from origins allowed with --allow-origin; programs that send
+    /// no Origin header only from this computer. The relay stops at the end of standard input.
+    Relay(RelayArgs),
 }
 
 #[derive(Args)]
@@ -44,28 +54,79 @@ struct SendArgs {
     /// Source name (the machine name is added in front).
     #[arg(long, default_value = "ntx send")]
     name: String,
-    /// Stable source id. Default: a new random id.
-    #[arg(long)]
-    id: Option<String>,
     /// TCP port (0 = any free port).
     #[arg(long, default_value_t = ntx::DEFAULT_PORT)]
     port: u16,
+    /// Require this pairing code.
+    #[arg(long)]
+    pair: Option<String>,
+    /// Do not advertise with mDNS.
+    #[arg(long)]
+    no_mdns: bool,
+    #[command(flatten)]
+    lines: LineArgs,
+}
+
+#[derive(Args)]
+struct PublishArgs {
+    /// Relay address: ws:// URL, `host` or `host:port` (with the path /publish).
+    #[arg(default_value = ntx::DEFAULT_RELAY_URL)]
+    relay: String,
+    /// Name of the published source (the relay adds its machine name).
+    #[arg(long, default_value = "ntx publish")]
+    name: String,
+    /// The relay's pairing code.
+    #[arg(long)]
+    pair: Option<String>,
+    #[command(flatten)]
+    lines: LineArgs,
+}
+
+/// What `send` and `publish` send.
+#[derive(Args)]
+struct LineArgs {
+    /// Stable source id. Default: a new random id.
+    #[arg(long)]
+    id: Option<String>,
     /// Channel to send on.
     #[arg(long, default_value = ntx::PROGRAM)]
     channel: String,
     /// Also offer the preview channel.
     #[arg(long)]
     preview: bool,
-    /// Require this pairing code.
-    #[arg(long)]
-    pair: Option<String>,
     /// Treat each line as a JSON fields object of --type.
     #[arg(long)]
     json: bool,
     /// Type name used with --json.
     #[arg(long = "type", default_value = "ntx.text")]
     type_name: String,
-    /// Do not advertise with mDNS.
+}
+
+impl LineArgs {
+    fn channels(&self) -> Vec<String> {
+        let mut channels = vec![ntx::PROGRAM.to_string()];
+        if self.preview {
+            channels.push(ntx::PREVIEW.to_string());
+        }
+        channels
+    }
+}
+
+#[derive(Args)]
+struct RelayArgs {
+    /// Relay name (the machine name is added in front).
+    #[arg(long, default_value = "ntx relay")]
+    name: String,
+    /// TCP port on 127.0.0.1 (0 = any free port).
+    #[arg(long, default_value_t = ntx::DEFAULT_PORT)]
+    port: u16,
+    /// Require this pairing code from publishers.
+    #[arg(long)]
+    pair: Option<String>,
+    /// Allow web pages from this origin to publish, e.g. `https://example.com`. Repeat for more.
+    #[arg(long = "allow-origin")]
+    allowed_origins: Vec<String>,
+    /// Do not advertise the published sources with mDNS.
     #[arg(long)]
     no_mdns: bool,
 }
@@ -114,6 +175,8 @@ fn main() -> ExitCode {
         Command::Send(args) => send(&args),
         Command::Recv(args) => recv(&args),
         Command::List(args) => list(&args),
+        Command::Publish(args) => publish(&args),
+        Command::Relay(args) => relay(&args),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
@@ -122,24 +185,15 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `MACHINE (name)`, the naming style recommended by the spec (clause 8.2).
-fn display_name(name: &str) -> String {
-    let host = gethostname::gethostname().to_string_lossy().into_owned();
-    let machine = host.split('.').next().unwrap_or(&host).to_uppercase();
-    format!("{machine} ({name})")
-}
-
 fn send(args: &SendArgs) -> CliResult {
     let mut config = SourceConfig::new(display_name(&args.name));
-    if let Some(id) = &args.id {
+    if let Some(id) = &args.lines.id {
         config.id.clone_from(id);
     }
     config.port = args.port;
     config.pairing_code.clone_from(&args.pair);
     config.advertise = !args.no_mdns;
-    if args.preview {
-        config.channels.push(ntx::PREVIEW.to_string());
-    }
+    config.channels = args.lines.channels();
     let source = Source::start(config)?;
     let identity = source.identity();
     eprintln!(
@@ -148,46 +202,145 @@ fn send(args: &SendArgs) -> CliResult {
         source.local_addr(),
         identity.id
     );
-    eprintln!("type a line and press Enter to send it; an empty line clears; Ctrl-D quits");
+    let describe = |event| match event {
+        SourceEvent::ReceiverConnected {
+            connection,
+            receiver,
+            address,
+        } => format!("+ receiver #{connection} \"{}\" from {address}", receiver.name),
+        SourceEvent::ReceiverDisconnected { connection } => format!("- receiver #{connection}"),
+        SourceEvent::TallyChanged(tally) => describe_tally(tally),
+    };
+    reporting(
+        |t| source.wait_event(t),
+        describe,
+        || send_lines(&args.lines, &source),
+    )
+}
 
+fn publish(args: &PublishArgs) -> CliResult {
+    let mut config = PublisherConfig::new(&args.name);
+    if let Some(id) = &args.lines.id {
+        config.id.clone_from(id);
+    }
+    config.pairing_code.clone_from(&args.pair);
+    config.channels = args.lines.channels();
+    let publisher = Publisher::connect(&args.relay, config)?;
+    eprintln!("publishing to {}", publisher.url());
+    let describe = |event| match event {
+        PublisherEvent::Connected { relay, .. } => format!("connected to relay \"{}\"", relay.name),
+        PublisherEvent::Tally(tally) => describe_tally(tally),
+        PublisherEvent::Error { code, message } => {
+            format!("relay error: {} {}", code.as_str(), message.unwrap_or_default())
+        }
+        PublisherEvent::Disconnected { reason } => format!("disconnected: {reason} (retrying)"),
+    };
+    reporting(
+        |t| publisher.wait_event(t),
+        describe,
+        || send_lines(&args.lines, &publisher),
+    )
+}
+
+fn relay(args: &RelayArgs) -> CliResult {
+    let mut config = RelayConfig::new(display_name(&args.name));
+    config.port = args.port;
+    config.pairing_code.clone_from(&args.pair);
+    config.allowed_origins.clone_from(&args.allowed_origins);
+    config.advertise = !args.no_mdns;
+    let path = config.path.clone();
+    let relay = Relay::start(config)?;
+    eprintln!("relay listening on ws://{}{path}", relay.local_addr());
+    eprintln!("Ctrl-D stops the relay");
+    let describe = |event| match event {
+        RelayEvent::OriginRequested { origin } => {
+            format!("refused a page from {origin} (to allow it, restart with --allow-origin {origin})")
+        }
+        RelayEvent::PublisherConnected {
+            connection,
+            source,
+            address,
+            port,
+            ..
+        } => format!(
+            "+ publisher #{connection} from {address}: serving \"{}\" at ws://127.0.0.1:{port}/",
+            source.name
+        ),
+        RelayEvent::PublisherDisconnected { connection } => format!("- publisher #{connection}"),
+    };
+    reporting(
+        |t| relay.wait_event(t),
+        describe,
+        || {
+            for line in std::io::stdin().lock().lines() {
+                line?;
+            }
+            Ok(())
+        },
+    )
+}
+
+fn describe_tally(tally: Tally) -> String {
+    format!("tally: on air {}, preview {}", tally.program, tally.preview)
+}
+
+/// Runs `body` while another thread prints the events that `wait` returns.
+fn reporting<E>(
+    wait: impl Fn(Duration) -> Option<E> + Sync,
+    describe: impl Fn(E) -> String + Sync,
+    body: impl FnOnce() -> CliResult,
+) -> CliResult {
     let done = AtomicBool::new(false);
     std::thread::scope(|scope| {
-        scope.spawn(|| report_source_events(&source, &done));
-        let result = send_lines(&source, args);
+        scope.spawn(|| {
+            while !done.load(Ordering::Relaxed) {
+                if let Some(event) = wait(Duration::from_millis(100)) {
+                    eprintln!("{}", describe(event));
+                }
+            }
+        });
+        let result = body();
         done.store(true, Ordering::Relaxed);
         result
     })
 }
 
-fn report_source_events(source: &Source, done: &AtomicBool) {
-    while !done.load(Ordering::Relaxed) {
-        match source.wait_event(Duration::from_millis(100)) {
-            Some(SourceEvent::ReceiverConnected {
-                connection,
-                receiver,
-                address,
-            }) => {
-                eprintln!("+ receiver #{connection} \"{}\" from {address}", receiver.name);
-            }
-            Some(SourceEvent::ReceiverDisconnected { connection }) => eprintln!("- receiver #{connection}"),
-            Some(SourceEvent::TallyChanged(tally)) => {
-                eprintln!("tally: on air {}, preview {}", tally.program, tally.preview);
-            }
-            None => {}
-        }
-    }
+/// What `send` and `publish` send lines with: a source or a publisher.
+trait Lines {
+    fn update(&self, channel: &str, type_name: &str, fields: Fields) -> ntx::Result<u64>;
+    fn update_text(&self, channel: &str, text: &str) -> ntx::Result<u64>;
+    fn clear(&self, channel: &str) -> ntx::Result<u64>;
 }
 
-fn send_lines(source: &Source, args: &SendArgs) -> CliResult {
+macro_rules! lines {
+    ($($sender:ty),*) => {$(
+        impl Lines for $sender {
+            fn update(&self, channel: &str, type_name: &str, fields: Fields) -> ntx::Result<u64> {
+                <$sender>::update(self, channel, type_name, fields)
+            }
+            fn update_text(&self, channel: &str, text: &str) -> ntx::Result<u64> {
+                <$sender>::update_text(self, channel, text)
+            }
+            fn clear(&self, channel: &str) -> ntx::Result<u64> {
+                <$sender>::clear(self, channel)
+            }
+        }
+    )*};
+}
+
+lines!(Source, Publisher);
+
+/// Sends each line of standard input with `sender`.
+fn send_lines(args: &LineArgs, sender: &impl Lines) -> CliResult {
+    eprintln!("type a line and press Enter to send it; an empty line clears; Ctrl-D quits");
     for line in std::io::stdin().lock().lines() {
         let line = line?;
         let seq = if line.is_empty() {
-            source.clear(&args.channel)?
+            sender.clear(&args.channel)?
         } else if args.json {
-            let fields: Fields = serde_json::from_str(&line)?;
-            source.update(&args.channel, &args.type_name, fields)?
+            sender.update(&args.channel, &args.type_name, serde_json::from_str(&line)?)?
         } else {
-            source.update_text(&args.channel, &line)?
+            sender.update_text(&args.channel, &line)?
         };
         eprintln!("sent seq {seq}");
     }

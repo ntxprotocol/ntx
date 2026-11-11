@@ -484,6 +484,7 @@ dependencies = [
  "ntx",
  "serde_json",
  "tracing-subscriber",
+ "tungstenite",
 ]
 
 [[package]]

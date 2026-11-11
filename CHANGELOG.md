@@ -17,3 +17,21 @@ All notable changes are listed here. The format follows
 - `ntx-ffi`: C ABI (opaque handles, JSON settings and events, polling), `ntx.h` header generated
   by cbindgen, and a C example that is compiled and run by the tests.
 - Events serialise to JSON (`{"event": ..., "data": ...}`).
+- Publishing through a relay (spec clause 14): `Publisher` sends text through a relay, with
+  pairing, tally events and reconnection; `Relay` serves each publisher to the network as a
+  source, checks web page origins against an allow-list (`origin_requested` events,
+  `allow_origin`, `revoke_origin`; `null` always refused), accepts programs without an `Origin`
+  header from loopback only, limits publishers (32, and 8 per origin), lets the newest connection
+  for a source id win, and keeps each published source on the same port when its publisher
+  reconnects. Dropping a publisher first delivers unsent text (up to 3 seconds). Also in the C ABI
+  (`ntx_publisher_*`, `ntx_relay_*`) and the CLI (`ntx publish`, `ntx relay`).
+- Security hardening for sources and relays: at most 64 connections per endpoint and 16 per IP
+  address, refused before the WebSocket upgrade; the upgrade must finish within 10 seconds; frame
+  queues are bounded (a peer that falls 256 frames behind is dropped and gets the full state when
+  it reconnects); a send that stalls for 15 seconds ends the connection; 10 wrong pairing codes
+  from one address lock it out for a minute. Relays accept only `http(s)` origins, ask the app
+  about at most 8 unanswered origins and at most one per second, and refuse to listen beyond
+  loopback without a pairing code.
+- Closing a connection waits briefly for the other side's close, so a final `error` is not lost
+  (Windows resets connections closed with unread data). Close reasons are cut to fit a close
+  frame.

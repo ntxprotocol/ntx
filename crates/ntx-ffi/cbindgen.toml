@@ -17,7 +17,8 @@ after_includes = """
  * - Handles come from ntx_*_start / ntx_*_connect and are freed with ntx_*_free.
  *   They may be used from any thread.
  * - Events are polled with ntx_*_wait_event(); the library never calls back into your code.
+ *   Events queue up until read: poll regularly, or free the handle when done.
  */"""
 
 [export]
-include = ["NtxSource", "NtxReceiver", "NtxBrowser"]
+include = ["NtxSource", "NtxReceiver", "NtxBrowser", "NtxPublisher", "NtxRelay"]

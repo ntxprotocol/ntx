@@ -16,10 +16,13 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
-gethostname = "1.1.0"
 ntx = { version = "0.1.0", path = "../ntx" }
 serde_json = "1.0.154"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+gethostname = "1.1.0"
+tungstenite = "0.30"
 
 [lints]
 workspace = true

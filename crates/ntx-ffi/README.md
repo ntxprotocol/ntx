@@ -11,7 +11,7 @@ native interface that the C/C++, Python, Node, Java and .NET bindings wrap.
 
 | Topic | Rule |
 | --- | --- |
-| Objects | Opaque handles: `NtxSource`, `NtxReceiver`, `NtxBrowser`, freed with `ntx_*_free` |
+| Objects | Opaque handles: `NtxSource`, `NtxReceiver`, `NtxBrowser`, `NtxPublisher`, `NtxRelay`, freed with `ntx_*_free` |
 | Data | Settings, fields and events are UTF-8 JSON strings |
 | Events | Polled with `ntx_*_wait_event(handle, timeout_ms)`; no callbacks into your code |
 | Errors | `NTX_OK` (0) or a negative code; `ntx_last_error()` explains the failure |

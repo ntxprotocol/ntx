@@ -3,10 +3,12 @@
 
 mod common;
 
-use std::net::TcpListener;
 use std::time::Duration;
 
-use common::{Raw, WAIT, raw_connect, read_close, read_json, receiver_config, send_json, source, wait_for};
+use common::{
+    Raw, WAIT, accept, fake_server, raw_connect, read, read_close, read_json, receiver_config, send_json,
+    source, wait_for, write,
+};
 use ntx::protocol::ErrorCode;
 use ntx::{Receiver, ReceiverEvent, SourceEvent};
 use serde_json::{Value, json};
@@ -121,39 +123,6 @@ fn source_closes_when_dropped() {
     assert_eq!(read_close(&mut ws), 1005);
 }
 
-/// A fake source: accepts one receiver and hands back the raw socket.
-fn fake_source() -> (TcpListener, String) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("ws://{}/", listener.local_addr().unwrap());
-    (listener, url)
-}
-
-#[allow(clippy::result_large_err)] // the callback's error type comes from tungstenite
-fn accept(listener: &TcpListener) -> tungstenite::WebSocket<std::net::TcpStream> {
-    let (stream, _) = listener.accept().unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let confirm_ntx = |_: &tungstenite::handshake::server::Request,
-                       mut response: tungstenite::handshake::server::Response| {
-        response
-            .headers_mut()
-            .insert("sec-websocket-protocol", "ntx".parse().unwrap());
-        Ok(response)
-    };
-    tungstenite::accept_hdr(stream, confirm_ntx).unwrap()
-}
-
-fn read<S: std::io::Read + std::io::Write>(ws: &mut tungstenite::WebSocket<S>) -> Value {
-    loop {
-        if let WsMessage::Text(text) = ws.read().unwrap() {
-            return serde_json::from_str(&text).unwrap();
-        }
-    }
-}
-
-fn write<S: std::io::Read + std::io::Write>(ws: &mut tungstenite::WebSocket<S>, value: &Value) {
-    ws.send(WsMessage::text(value.to_string())).unwrap();
-}
-
 fn hello(ntx: &str) -> Value {
     json!({"op": "hello", "ntx": ntx, "source": {"id": "fake", "name": "FAKE"}, "channels": ["program"], "session": "s1"})
 }
@@ -186,7 +155,7 @@ fn receiver_rejects_other_versions_and_bad_hellos() {
         (json!({"op": "error", "code": "not_allowed"}), None),
     ];
     for (first, answer) in cases {
-        let (listener, url) = fake_source();
+        let (listener, url) = fake_server("/");
         let r = one_shot_receiver(&url);
         let mut ws = accept(&listener);
         write(&mut ws, &first);
@@ -200,7 +169,7 @@ fn receiver_rejects_other_versions_and_bad_hellos() {
 
 #[test]
 fn receiver_filters_repeats_and_reports_everything_else() {
-    let (listener, url) = fake_source();
+    let (listener, url) = fake_server("/");
     let r = one_shot_receiver(&url);
     let mut ws = accept(&listener);
     write(&mut ws, &hello("0.1"));
@@ -247,7 +216,7 @@ fn receiver_filters_repeats_and_reports_everything_else() {
 
 #[test]
 fn receiver_pings_a_quiet_source_and_gives_up_on_a_silent_one() {
-    let (listener, url) = fake_source();
+    let (listener, url) = fake_server("/");
     let r = one_shot_receiver(&url);
     let mut ws = accept(&listener);
     write(&mut ws, &hello("0.1"));
@@ -268,8 +237,75 @@ fn receiver_pings_a_quiet_source_and_gives_up_on_a_silent_one() {
 
 #[test]
 fn receiver_reports_a_refused_connection() {
-    let (listener, url) = fake_source();
+    let (listener, url) = fake_server("/");
     drop(listener);
     let r = one_shot_receiver(&url);
     assert_ne!(disconnect_reason(&r), "");
+}
+
+#[test]
+fn idle_connections_are_limited_and_time_out() {
+    use std::io::Read;
+    let s = source(None);
+    // Sockets that never send an upgrade request: one address may hold 16 places at most.
+    let mut idle: Vec<_> = (0..16)
+        .map(|_| std::net::TcpStream::connect(s.local_addr()).unwrap())
+        .collect();
+    let one_too_many = tungstenite::connect(format!("ws://{}/", s.local_addr()));
+    assert!(one_too_many.is_err(), "a connection over the limit was served");
+    // Without an upgrade within 10 seconds, the source closes them and frees their places.
+    idle[0].set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+    assert_eq!(idle[0].read(&mut [0; 16]).unwrap(), 0);
+    let r = common::receiver(&s, &["program"], None);
+    common::next_update(&r);
+}
+
+#[test]
+fn a_receiver_that_stops_reading_is_dropped() {
+    let s = source(None);
+    let _stalled = subscribed(&s); // never read again
+    wait_for(
+        || s.wait_event(WAIT),
+        |e| matches!(e, SourceEvent::ReceiverConnected { .. }).then_some(()),
+    );
+    // Far more than fits in socket buffers and the queue: memory must not grow without bound.
+    let big = "x".repeat(60_000);
+    for _ in 0..1000 {
+        s.update_text("program", &big).unwrap();
+    }
+    wait_for(
+        || s.wait_event(Duration::from_secs(25)),
+        |e| matches!(e, SourceEvent::ReceiverDisconnected { .. }).then_some(()),
+    );
+    assert_eq!(s.receiver_count(), 0);
+}
+
+#[test]
+fn repeated_wrong_pairing_codes_lock_the_address_out() {
+    let s = source(Some("1234"));
+    let url = format!("ws://{}/", s.local_addr());
+    let attempt = |code: &str| {
+        let mut ws = raw_connect(&url);
+        let nonce = read_json(&mut ws)["pairing"]["nonce"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut answer = subscribe("0.1");
+        answer["pairing"] = json!({"proof": ntx::pairing::proof(code, &nonce)});
+        send_json(&mut ws, &answer);
+        read_json(&mut ws)
+    };
+    // Guesses in parallel are counted too.
+    std::thread::scope(|scope| {
+        let guesses: Vec<_> = (0..10).map(|_| scope.spawn(|| attempt("0000"))).collect();
+        for guess in guesses {
+            assert_eq!(guess.join().unwrap()["code"], "pairing_failed");
+        }
+    });
+    let locked = attempt("1234");
+    assert_eq!(locked["code"], "pairing_failed");
+    assert!(
+        locked["message"].as_str().unwrap().contains("try again later"),
+        "{locked}"
+    );
 }
