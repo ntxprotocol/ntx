@@ -37,6 +37,6 @@ All notable changes are listed here. The format follows
   frame.
 - Python bindings (`bindings/python`): package `ntx-protocol`, import `ntxprotocol`, built with
   PyO3 as one `abi3` wheel for Python 3.9+. Typed `Source`, `Receiver`, `Browser`, event
-  dataclasses, `render`, and exceptions for each error. Events are polled and waiting releases
+  dataclasses, `render`, `display_name`, and exceptions for each error. Events are polled and waiting releases
   the GIL. Tests on real sockets, including mDNS discovery and the example script; Python and
   Rust binding coverage at least 90%, enforced. Wheels are built in CI but not published.

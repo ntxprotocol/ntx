@@ -120,6 +120,13 @@ def test_render() -> None:
     assert ntx.render(fields, "{lines}") == "For God\nso loved"
 
 
+def test_display_name() -> None:
+    machine, rest = ntx.display_name("Lyrics").split(" (", 1)
+    assert machine
+    assert machine == machine.upper()
+    assert rest == "Lyrics)"
+
+
 def test_versions() -> None:
     assert ntx.PROTOCOL_VERSION == "0.1"
     assert ntx.__version__.count(".") == 2

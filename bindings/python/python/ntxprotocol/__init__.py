@@ -4,6 +4,7 @@
 - :class:`Receiver` connects to a source, keeps its state and reconnects when needed.
 - :class:`Browser` finds sources on the local network.
 - :func:`render` turns fields into display text with a binding pattern.
+- :func:`display_name` makes a ``MACHINE (name)`` source name.
 
 Events are polled with ``poll_event()`` or ``wait_event(timeout)``; nothing calls back from
 another thread. Close objects with ``close()`` or a ``with`` block.
@@ -38,6 +39,7 @@ from ._ntx import (
     ClosedError,
     InvalidAddressError,
     InvalidMessageError,
+    InvalidOriginError,
     InvalidPatternError,
     InvalidTypeNameError,
     MdnsError,
@@ -46,6 +48,7 @@ from ._ntx import (
     NtxError,
     UnknownChannelError,
     __version__,
+    display_name,
 )
 from ._objects import Browser, Receiver, Source, render
 
@@ -65,6 +68,7 @@ __all__ = [
     "ErrorReport",
     "InvalidAddressError",
     "InvalidMessageError",
+    "InvalidOriginError",
     "InvalidPatternError",
     "InvalidTypeNameError",
     "MdnsError",
@@ -85,5 +89,6 @@ __all__ = [
     "UnknownChannelError",
     "Update",
     "__version__",
+    "display_name",
     "render",
 ]

@@ -11,6 +11,7 @@ __all__ = [
     "ClosedError",
     "InvalidAddressError",
     "InvalidMessageError",
+    "InvalidOriginError",
     "InvalidPatternError",
     "InvalidTypeNameError",
     "MdnsError",
@@ -21,6 +22,7 @@ __all__ = [
     "Source",
     "UnknownChannelError",
     "__version__",
+    "display_name",
     "render",
 ]
 
@@ -54,6 +56,9 @@ class MessageTooLargeError(NtxError):
 class InvalidAddressError(NtxError):
     """Invalid address."""
 
+class InvalidOriginError(NtxError):
+    """Invalid web origin (clause 14.5)."""
+
 class InvalidPatternError(NtxError):
     """Invalid pattern (clause 16.3)."""
 
@@ -61,6 +66,7 @@ class InvalidMessageError(NtxError):
     """A message is not valid NTX."""
 
 def render(fields_json: str, pattern: str) -> str: ...
+def display_name(name: str) -> str: ...
 
 @final
 class Source:

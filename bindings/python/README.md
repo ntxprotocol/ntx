@@ -104,6 +104,7 @@ with ntx.Browser() as browser:
 | Threads | Waiting releases the GIL and Ctrl-C interrupts it. Objects may be shared; `close()` from another thread ends a wait with `ClosedError` |
 | Errors | Exceptions derived from `NtxError`, e.g. `UnknownChannelError`, `ClosedError` |
 | Binding | `render(fields, "{reference} · {version}")` turns fields into text ([clause 16](https://github.com/ntxprotocol/spec/blob/main/ntx.md#16-binding-fields-to-display-elements)) |
+| Names | `display_name("Lyrics")` gives `CHURCH-PC (Lyrics)`, the name form the spec recommends ([clause 8.2](https://github.com/ntxprotocol/spec/blob/main/ntx.md#8-connection-handshake)) |
 
 Events by object:
 

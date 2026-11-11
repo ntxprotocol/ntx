@@ -39,6 +39,12 @@ create_exception!(
 create_exception!(_ntx, InvalidAddressError, NtxError, "Invalid address.");
 create_exception!(
     _ntx,
+    InvalidOriginError,
+    NtxError,
+    "Invalid web origin (clause 14.5)."
+);
+create_exception!(
+    _ntx,
     InvalidPatternError,
     NtxError,
     "Invalid pattern (clause 16.3)."
@@ -56,6 +62,7 @@ fn error(e: ntx::Error) -> PyErr {
         ntx::Error::UnknownChannel(_) => UnknownChannelError::new_err(message),
         ntx::Error::TooLarge(_) => MessageTooLargeError::new_err(message),
         ntx::Error::InvalidAddress(_) => InvalidAddressError::new_err(message),
+        ntx::Error::InvalidOrigin(_) => InvalidOriginError::new_err(message),
         ntx::Error::InvalidPattern(_) => InvalidPatternError::new_err(message),
         ntx::Error::InvalidMessage(_) => InvalidMessageError::new_err(message),
     }
@@ -143,6 +150,12 @@ fn render(fields_json: &str, pattern: &str) -> PyResult<String> {
     let fields: Fields = from_json(fields_json, "fields")?;
     let pattern = ntx::binding::Pattern::parse(pattern).map_err(error)?;
     Ok(pattern.render(&fields))
+}
+
+/// `MACHINE (name)`: the form of display name the spec recommends for sources (clause 8.2).
+#[pyfunction]
+fn display_name(name: &str) -> String {
+    ntx::display_name(name)
 }
 
 /// A running source.
@@ -315,6 +328,7 @@ fn ntx_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("PROGRAM", ntx::PROGRAM)?;
     m.add("PREVIEW", ntx::PREVIEW)?;
     m.add_function(wrap_pyfunction!(render, m)?)?;
+    m.add_function(wrap_pyfunction!(display_name, m)?)?;
     m.add_class::<PySource>()?;
     m.add_class::<PyReceiver>()?;
     m.add_class::<PyBrowser>()?;
@@ -326,6 +340,7 @@ fn ntx_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("UnknownChannelError", py.get_type::<UnknownChannelError>())?;
     m.add("MessageTooLargeError", py.get_type::<MessageTooLargeError>())?;
     m.add("InvalidAddressError", py.get_type::<InvalidAddressError>())?;
+    m.add("InvalidOriginError", py.get_type::<InvalidOriginError>())?;
     m.add("InvalidPatternError", py.get_type::<InvalidPatternError>())?;
     m.add("InvalidMessageError", py.get_type::<InvalidMessageError>())?;
     Ok(())
