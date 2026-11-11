@@ -116,7 +116,7 @@ impl Browser {
                     addresses.extend(p.addresses.iter().copied());
                 }
                 // Prefer addresses other computers can reach: IPv4 first, loopback last.
-                addresses.sort_by_key(|a| (a.is_loopback(), a.is_ipv6(), *a));
+                addresses.sort_by_key(|a| (a.is_loopback(), a.is_ipv6(), is_link_local_v6(a), *a));
                 addresses.dedup();
                 // Keep the address already reported while it is still valid, so the URL stays stable.
                 let kept = previous
@@ -180,6 +180,11 @@ impl Drop for Browser {
         let _ = self.daemon.stop_browse(SERVICE_TYPE);
         let _ = self.daemon.shutdown();
     }
+}
+
+/// IPv6 link-local addresses (`fe80::/10`) need an interface scope to be usable in a URL.
+fn is_link_local_v6(address: &IpAddr) -> bool {
+    matches!(address, IpAddr::V6(v6) if v6.segments()[0] & 0xffc0 == 0xfe80)
 }
 
 fn instance_name(fullname: &str) -> String {

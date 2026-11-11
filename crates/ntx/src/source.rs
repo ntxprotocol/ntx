@@ -317,8 +317,8 @@ fn advertise(config: &SourceConfig, port: u16) -> Result<(ServiceDaemon, String)
     }
     let info = ServiceInfo::new(
         SERVICE_TYPE,
-        &config.name,
-        &format!("{host}.local."),
+        dns_label(&config.name),
+        &format!("{}.local.", dns_label(&host)),
         "",
         port,
         &txt[..],
@@ -328,6 +328,17 @@ fn advertise(config: &SourceConfig, port: u16) -> Result<(ServiceDaemon, String)
     let fullname = info.get_fullname().to_string();
     daemon.register(info).map_err(mdns)?;
     Ok((daemon, fullname))
+}
+
+/// Shortens a name to the 63-byte limit of a DNS label (clause 6.2), keeping whole characters.
+/// Longer names make mDNS answers empty, so nobody would find the source.
+fn dns_label(name: &str) -> &str {
+    const MAX: usize = 63;
+    let end = (0..=MAX.min(name.len()))
+        .rev()
+        .find(|&i| name.is_char_boundary(i))
+        .unwrap_or(0);
+    &name[..end]
 }
 
 async fn accept_loop(listener: TcpListener, shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
@@ -548,5 +559,20 @@ fn recompute_tally(shared: &Shared) {
     if combined != state.tally {
         state.tally = combined;
         let _ = shared.events.send(SourceEvent::TallyChanged(combined));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dns_label;
+
+    #[test]
+    fn dns_labels_fit_in_63_bytes() {
+        assert_eq!(dns_label("CHURCH-PC (Lyrics)"), "CHURCH-PC (Lyrics)");
+        let long = format!("{} (probe)", "A".repeat(62));
+        assert_eq!(dns_label(&long), &long[..63]);
+        // "Ọ" is 3 bytes: never cut a character in half.
+        let accented = "Ọ".repeat(30);
+        assert_eq!(dns_label(&accented), "Ọ".repeat(21));
     }
 }

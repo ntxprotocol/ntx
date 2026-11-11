@@ -19,7 +19,12 @@ struct Sender {
 impl Sender {
     fn start(extra: &[&str]) -> Sender {
         let mut child = Command::new(NTX)
-            .args(["send", "--port", "0", "--name", "surface test"])
+            .args(["send", "--port", "0"])
+            .args(if extra.contains(&"--name") {
+                &[][..]
+            } else {
+                &["--name", "surface test"][..]
+            })
             .args(extra)
             .stdin(Stdio::piped())
             .stderr(Stdio::piped())
@@ -187,29 +192,20 @@ fn bad_input_fails_cleanly() {
 
 #[test]
 fn list_finds_an_advertised_sender() {
-    let sender = Sender::start(&["--id", "surface-list"]);
-    // mDNS can take several seconds to answer on busy machines (CI), so look a few times.
-    let listed = |output: &Output| {
-        output.status.success()
-            && stdout(output)
-                .iter()
-                .any(|l| l.contains("surface test") && l.contains("id surface-list"))
-    };
-    let attempts: Vec<Output> = (0..4)
-        .map(|_| {
-            Command::new(NTX)
-                .args(["list", "--seconds", "5"])
-                .output()
-                .unwrap()
-        })
-        .scan(false, |found, output| {
-            (!*found).then(|| {
-                *found = listed(&output);
-                output
-            })
-        })
-        .collect();
-    assert!(attempts.last().is_some_and(listed), "{attempts:?}");
+    // Longer than a DNS label (63 bytes): the advertised name must be shortened, not dropped.
+    let name = format!("surface test {}", "x".repeat(60));
+    let sender = Sender::start(&["--id", "surface-list", "--name", &name]);
+    let output = Command::new(NTX)
+        .args(["list", "--seconds", "6"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        stdout(&output)
+            .iter()
+            .any(|l| l.contains("surface test") && l.contains("id surface-list")),
+        "{output:?}"
+    );
     assert!(sender.finish().success());
 
     let nothing = Command::new(NTX)
