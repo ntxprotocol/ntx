@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
-use crate::client::{self, Client, Connection, Role, Settings, Stop};
+use crate::client::{self, Client, Connection, Progress, Role, Settings, Stop};
 use crate::protocol::{Endpoint, ErrorCode, ErrorMessage, Hello, Message, Tally, TypeDescriptor, Update};
 use crate::runtime::runtime;
 use crate::wire::{self, Ended, HEARTBEAT_INTERVAL, lock};
@@ -21,7 +21,9 @@ pub struct ReceiverConfig {
     pub channels: Vec<String>,
     /// Pairing code, if the source needs one.
     pub pairing_code: Option<String>,
-    /// Reconnect automatically after the connection is lost. Defaults to `true`.
+    /// Reconnect automatically after the connection is lost. Defaults to `true`. Even when on,
+    /// the receiver waits for [`Receiver::reconnect`] after an error that only the user can
+    /// fix (clause 11.3).
     pub reconnect: bool,
 }
 
@@ -44,7 +46,8 @@ impl ReceiverConfig {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub enum ReceiverEvent {
-    /// The handshake finished. Updates with the full state follow.
+    /// The source confirmed the subscription by sending its first `update` (clause 8.3). That
+    /// update and the rest of the state follow at once.
     Connected {
         /// The source's identity.
         source: Endpoint,
@@ -58,14 +61,19 @@ pub enum ReceiverEvent {
     /// New item for a channel. Old and repeated updates are already filtered out (clause 9.4),
     /// and text is normalised (clause 17).
     Update(Update),
-    /// The source reported an error.
+    /// The source reported an error, or this receiver found one that refuses the connection
+    /// (`unsupported_version`, or `pairing_required` when it has no pairing code). After
+    /// `unsupported_version`, `pairing_required`, `pairing_failed` and `not_allowed` it does not
+    /// reconnect until [`Receiver::reconnect`] is called (clause 11.3).
     Error {
         /// What went wrong.
         code: ErrorCode,
         /// Optional text for logs.
         message: Option<String>,
     },
-    /// The connection was lost or could not be made. The receiver retries if `reconnect` is on.
+    /// The connection was lost or could not be made. The receiver retries if `reconnect` is on,
+    /// waiting 1 second, then twice as long each time up to 10 seconds; the wait goes back to 1
+    /// second once an `update` arrives (clause 11.3).
     Disconnected {
         /// Why, for logs and people.
         reason: String,
@@ -77,6 +85,7 @@ pub struct Receiver {
     events: Mutex<mpsc::Receiver<ReceiverEvent>>,
     tally: watch::Sender<Option<Tally>>,
     stop: watch::Sender<Stop>,
+    retry: watch::Sender<()>,
     url: String,
 }
 
@@ -92,6 +101,7 @@ impl Receiver {
         let (events_tx, events_rx) = mpsc::channel();
         let (tally, tally_rx) = watch::channel(None);
         let (stop, stop_rx) = watch::channel(Stop::Run);
+        let (retry, retry_rx) = watch::channel(());
         let settings = Settings::new(
             Role::Receiver,
             url.clone(),
@@ -107,11 +117,12 @@ impl Receiver {
             tally: tally_rx,
             seen: Seen::default(),
         };
-        runtime().spawn(client::keep_connected(link, stop_rx));
+        runtime().spawn(client::keep_connected(link, stop_rx, retry_rx));
         Ok(Receiver {
             events: Mutex::new(events_rx),
             tally,
             stop,
+            retry,
             url,
         })
     }
@@ -119,6 +130,12 @@ impl Receiver {
     /// Tells the source whether its text is on air or in preview (clause 10).
     pub fn set_tally(&self, tally: Tally) {
         self.tally.send_replace(Some(tally));
+    }
+
+    /// Connects again now, after the connection was lost: also after an error that stopped
+    /// reconnecting (clause 11.3), or when `reconnect` is off. Has no effect while connected.
+    pub fn reconnect(&self) {
+        self.retry.send_replace(());
     }
 
     /// Takes the next event, if any.
@@ -185,42 +202,23 @@ impl Client for Link {
         &self.settings
     }
 
-    async fn connected(&mut self, mut peer: Connection, hello: Hello, _: watch::Receiver<Stop>) -> Ended {
+    async fn connected(
+        &mut self,
+        mut peer: Connection,
+        hello: Hello,
+        _: watch::Receiver<Stop>,
+        progress: &mut Progress,
+    ) -> Ended {
         self.seen.start_session(&hello.session);
-        let _ = self.events.send(ReceiverEvent::Connected {
-            source: hello.source,
-            session: hello.session,
-            channels: hello.channels,
+        let mut pending = Some(Pending {
+            hello,
+            announce: None,
         });
-        self.receive(&mut peer).await
-    }
-
-    fn refused(&mut self, error: ErrorMessage) {
-        let _ = self.events.send(ReceiverEvent::Error {
-            code: error.code,
-            message: error.message,
-        });
-    }
-
-    fn disconnected(&mut self, reason: String) -> bool {
-        self.events.send(ReceiverEvent::Disconnected { reason }).is_ok()
-    }
-}
-
-impl Link {
-    /// Receives until the connection ends, sending tally whenever it changes.
-    async fn receive(&mut self, peer: &mut Connection) -> Ended {
         self.tally.mark_changed(); // send the current tally, if any, on every new connection
         let mut tick = tokio::time::interval(HEARTBEAT_INTERVAL);
         loop {
             let outcome = tokio::select! {
-                message = peer.recv() => match message {
-                    Ok(message) => {
-                        self.handle(message);
-                        Ok(())
-                    }
-                    Err(ended) => Err(ended),
-                },
+                message = peer.recv() => message.map(|m| self.handle(m, &mut pending, progress)),
                 changed = self.tally.changed() => {
                     let current = *self.tally.borrow_and_update();
                     match (changed, current) {
@@ -237,19 +235,60 @@ impl Link {
         }
     }
 
-    fn handle(&mut self, message: Message) {
-        let event = match message {
-            Message::Update(update) if self.seen.is_new(&update) => ReceiverEvent::Update(Update {
-                fields: wire::normalize_fields(update.fields),
-                ..update
-            }),
-            Message::Announce(a) => ReceiverEvent::Announce(a.types),
-            Message::Error(e) => ReceiverEvent::Error {
-                code: e.code,
-                message: e.message,
+    fn error(&mut self, error: ErrorMessage) {
+        let _ = self.events.send(ReceiverEvent::Error {
+            code: error.code,
+            message: error.message,
+        });
+    }
+
+    fn disconnected(&mut self, reason: String) -> bool {
+        self.events.send(ReceiverEvent::Disconnected { reason }).is_ok()
+    }
+}
+
+/// A connection the source has not confirmed yet, and the announcement held until it does.
+struct Pending {
+    hello: Hello,
+    announce: Option<Vec<TypeDescriptor>>,
+}
+
+impl Link {
+    fn handle(&mut self, message: Message, pending: &mut Option<Pending>, progress: &mut Progress) {
+        match message {
+            Message::Update(update) => {
+                if let Some(Pending { hello, announce }) = pending.take() {
+                    // The first update confirms the subscription (clause 8.3).
+                    progress.confirmed = true;
+                    self.send(ReceiverEvent::Connected {
+                        source: hello.source,
+                        session: hello.session,
+                        channels: hello.channels,
+                    });
+                    if let Some(types) = announce {
+                        self.send(ReceiverEvent::Announce(types));
+                    }
+                }
+                if self.seen.is_new(&update) {
+                    self.send(ReceiverEvent::Update(Update {
+                        fields: wire::normalize_fields(update.fields),
+                        ..update
+                    }));
+                }
+            }
+            Message::Announce(a) => match pending {
+                Some(pending) => pending.announce = Some(a.types),
+                None => self.send(ReceiverEvent::Announce(a.types)),
             },
-            _ => return,
-        };
+            Message::Error(e) => {
+                progress.error(&e);
+                self.error(e);
+            }
+            _ => {}
+        }
+    }
+
+    fn send(&self, event: ReceiverEvent) {
         let _ = self.events.send(event);
     }
 }

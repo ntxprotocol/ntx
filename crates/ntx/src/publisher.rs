@@ -1,10 +1,10 @@
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc as tmpsc, watch};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::client::{self, Client, Connection, Role, Settings, Stop};
+use crate::client::{self, Client, Connection, MAX_WAIT, Progress, Role, Settings, Stop};
 use crate::protocol::{Endpoint, ErrorCode, ErrorMessage, Fields, Hello, Message, Tally, TypeDescriptor};
 use crate::runtime::runtime;
 use crate::store::{Store, text_shortcuts};
@@ -25,7 +25,9 @@ pub struct PublisherConfig {
     pub channels: Vec<String>,
     /// Pairing code, if the relay needs one.
     pub pairing_code: Option<String>,
-    /// Reconnect automatically after the connection is lost. Defaults to `true`.
+    /// Reconnect automatically after the connection is lost. Defaults to `true`. Even when on,
+    /// the publisher waits for [`Publisher::reconnect`] after an error that only the user can
+    /// fix (clause 11.3).
     pub reconnect: bool,
 }
 
@@ -58,8 +60,10 @@ pub enum PublisherEvent {
     },
     /// The combined tally of the receivers showing the published source changed (clause 14.3).
     Tally(Tally),
-    /// The relay reported an error. After `not_allowed` the publisher does not reconnect: the
-    /// relay refused it (clause 14.5).
+    /// The relay reported an error, or this publisher found one that refuses the connection
+    /// (`unsupported_version`, or `pairing_required` when it has no pairing code). After
+    /// `unsupported_version`, `pairing_required`, `pairing_failed` and `not_allowed` it does not
+    /// reconnect until [`Publisher::reconnect`] is called (clause 11.3).
     Error {
         /// What went wrong.
         code: ErrorCode,
@@ -67,7 +71,9 @@ pub enum PublisherEvent {
         message: Option<String>,
     },
     /// The connection was lost, refused or could not be made. The publisher retries if
-    /// `reconnect` is on.
+    /// `reconnect` is on, waiting 1 second, then twice as long each time up to 10 seconds. A
+    /// relay sends no `update` to confirm a publisher, so the wait goes back to 1 second after
+    /// a connection that lasted 10 seconds.
     Disconnected {
         /// Why, for logs and people.
         reason: String,
@@ -86,6 +92,7 @@ pub struct Publisher {
     state: Arc<Mutex<State>>,
     events: Mutex<mpsc::Receiver<PublisherEvent>>,
     stop: watch::Sender<Stop>,
+    retry: watch::Sender<()>,
     /// Disconnects when the background task ends.
     done: Mutex<mpsc::Receiver<()>>,
     url: String,
@@ -124,21 +131,22 @@ impl Publisher {
         )?;
         let (events_tx, events_rx) = mpsc::channel();
         let (stop, stop_rx) = watch::channel(Stop::Run);
+        let (retry, retry_rx) = watch::channel(());
         let (done_tx, done) = mpsc::channel();
         let link = Link {
             settings,
             state: state.clone(),
             events: events_tx,
-            not_allowed: false,
         };
         runtime().spawn(async move {
-            client::keep_connected(link, stop_rx).await;
+            client::keep_connected(link, stop_rx, retry_rx).await;
             drop(done_tx);
         });
         Ok(Publisher {
             state,
             events: Mutex::new(events_rx),
             stop,
+            retry,
             done: Mutex::new(done),
             url,
         })
@@ -170,6 +178,12 @@ impl Publisher {
         let frame = state.store.announce(types)?;
         state.send(frame);
         Ok(())
+    }
+
+    /// Connects again now, after the connection was lost: also after an error that stopped
+    /// reconnecting (clause 11.3), or when `reconnect` is off. Has no effect while connected.
+    pub fn reconnect(&self) {
+        self.retry.send_replace(());
     }
 
     /// Takes the next event, if any.
@@ -218,18 +232,6 @@ struct Link {
     settings: Settings,
     state: Arc<Mutex<State>>,
     events: mpsc::Sender<PublisherEvent>,
-    /// The relay refused this publisher (clause 14.5); do not reconnect.
-    not_allowed: bool,
-}
-
-impl Link {
-    fn error(&mut self, error: ErrorMessage) {
-        self.not_allowed |= error.code == ErrorCode::NotAllowed;
-        let _ = self.events.send(PublisherEvent::Error {
-            code: error.code,
-            message: error.message,
-        });
-    }
 }
 
 impl Client for Link {
@@ -242,7 +244,9 @@ impl Client for Link {
         mut peer: Connection,
         hello: Hello,
         mut stop: watch::Receiver<Stop>,
+        progress: &mut Progress,
     ) -> Ended {
+        let started = Instant::now();
         // The relay starts a new session for every connection (clause 14.4), so send the whole
         // state again, as a source does on connect (clause 9.2). Under one lock, so no update is
         // lost or sent twice.
@@ -266,10 +270,14 @@ impl Client for Link {
         };
         let ended = wire::pump(&mut peer, &mut out_rx, stopping, |message| match message {
             Message::Tally(tally) => drop(self.events.send(PublisherEvent::Tally(tally))),
-            Message::Error(e) => self.error(e),
+            Message::Error(e) => {
+                progress.error(&e);
+                self.error(e);
+            }
             _ => {}
         })
         .await;
+        progress.confirmed = started.elapsed() >= MAX_WAIT;
         {
             let mut state = lock(&self.state);
             state.out = None;
@@ -280,11 +288,14 @@ impl Client for Link {
         ended
     }
 
-    fn refused(&mut self, error: ErrorMessage) {
-        self.error(error);
+    fn error(&mut self, error: ErrorMessage) {
+        let _ = self.events.send(PublisherEvent::Error {
+            code: error.code,
+            message: error.message,
+        });
     }
 
     fn disconnected(&mut self, reason: String) -> bool {
-        self.events.send(PublisherEvent::Disconnected { reason }).is_ok() && !self.not_allowed
+        self.events.send(PublisherEvent::Disconnected { reason }).is_ok()
     }
 }

@@ -165,6 +165,15 @@ int ntx_receiver_set_tally(const struct NtxReceiver *receiver, bool program, boo
 // Pointers must be null or valid: NUL-terminated UTF-8 strings, live handles (see `ntx.h`).
 char *ntx_receiver_wait_event(const struct NtxReceiver *receiver, uint32_t timeout_ms);
 
+// Connects again now after the connection was lost: also after an error that stopped
+// reconnecting (`unsupported_version`, `pairing_required`, `pairing_failed`, `not_allowed`;
+// clause 11.3), or when `reconnect` is off. Has no effect while connected.
+//
+// # Safety
+//
+// Pointers must be null or valid: live handles (see `ntx.h`).
+int ntx_receiver_reconnect(const struct NtxReceiver *receiver);
+
 // Disconnects and frees the handle. Null is ignored.
 //
 // # Safety
@@ -249,6 +258,13 @@ int ntx_publisher_announce(const struct NtxPublisher *publisher, const char *typ
 //
 // Pointers must be null or valid: NUL-terminated UTF-8 strings, live handles (see `ntx.h`).
 char *ntx_publisher_wait_event(const struct NtxPublisher *publisher, uint32_t timeout_ms);
+
+// Connects again now, like [`ntx_receiver_reconnect`].
+//
+// # Safety
+//
+// Pointers must be null or valid: live handles (see `ntx.h`).
+int ntx_publisher_reconnect(const struct NtxPublisher *publisher);
 
 // Disconnects and frees the handle. Null is ignored.
 //

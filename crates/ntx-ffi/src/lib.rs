@@ -202,6 +202,34 @@ macro_rules! sends {
 
 sends!(NtxSource, NtxPublisher);
 
+/// Handles that connect to another endpoint: receivers and publishers.
+trait Connects {
+    fn reconnect(&self);
+}
+
+macro_rules! connects {
+    ($($handle:ty),*) => {$(
+        impl Connects for $handle {
+            fn reconnect(&self) {
+                self.0.reconnect();
+            }
+        }
+    )*};
+}
+
+connects!(NtxReceiver, NtxPublisher);
+
+/// # Safety
+///
+/// `handle` is null or a live handle from this library.
+unsafe fn reconnect<T: Connects>(handle: *const T) -> c_int {
+    call(|| {
+        // SAFETY: forwarded from the caller.
+        unsafe { handle_arg(handle) }?.reconnect();
+        Ok(())
+    })
+}
+
 /// Waits up to `timeout_ms` for the next event of `handle`, as JSON, or null.
 ///
 /// # Safety
@@ -590,6 +618,19 @@ pub unsafe extern "C" fn ntx_receiver_wait_event(
     unsafe { wait_event(receiver, timeout_ms) }
 }
 
+/// Connects again now after the connection was lost: also after an error that stopped
+/// reconnecting (`unsupported_version`, `pairing_required`, `pairing_failed`, `not_allowed`;
+/// clause 11.3), or when `reconnect` is off. Has no effect while connected.
+///
+/// # Safety
+///
+/// Pointers must be null or valid: live handles (see `ntx.h`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ntx_receiver_reconnect(receiver: *const NtxReceiver) -> c_int {
+    // SAFETY: pointer rules are the caller's, as documented.
+    unsafe { reconnect(receiver) }
+}
+
 /// Disconnects and frees the handle. Null is ignored.
 ///
 /// # Safety
@@ -745,6 +786,17 @@ pub unsafe extern "C" fn ntx_publisher_wait_event(
 ) -> *mut c_char {
     // SAFETY: pointer rules are the caller's, as documented.
     unsafe { wait_event(publisher, timeout_ms) }
+}
+
+/// Connects again now, like [`ntx_receiver_reconnect`].
+///
+/// # Safety
+///
+/// Pointers must be null or valid: live handles (see `ntx.h`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ntx_publisher_reconnect(publisher: *const NtxPublisher) -> c_int {
+    // SAFETY: pointer rules are the caller's, as documented.
+    unsafe { reconnect(publisher) }
 }
 
 /// Disconnects and frees the handle. Null is ignored.

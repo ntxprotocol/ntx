@@ -244,6 +244,51 @@ fn publisher_reports_a_refusal() {
 }
 
 #[test]
+fn a_refused_publisher_waits_for_the_app() {
+    // Clause 11.3: no automatic reconnect after not_allowed, even with reconnect on.
+    let (listener, url) = fake_server("/publish");
+    let p = Publisher::connect(&url, publisher_config("pub-waits", None)).unwrap();
+    let mut ws = accept(&listener);
+    write(&mut ws, &json!({"op": "error", "code": "not_allowed"}));
+    let code = wait_for(
+        || p.wait_event(WAIT),
+        |e| match e {
+            PublisherEvent::Error { code, .. } => Some(code),
+            _ => None,
+        },
+    );
+    assert_eq!(code, ErrorCode::NotAllowed);
+    wait_for(
+        || p.wait_event(WAIT),
+        |e| matches!(e, PublisherEvent::Disconnected { .. }).then_some(()),
+    );
+    listener.set_nonblocking(true).unwrap();
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(listener.accept().is_err(), "reconnected by itself");
+    listener.set_nonblocking(false).unwrap();
+    p.reconnect();
+    let mut again = accept(&listener);
+    write(&mut again, &hello(None));
+    assert_eq!(read(&mut again)["op"], "publish");
+}
+
+#[test]
+fn a_publisher_without_the_code_gives_up() {
+    let (listener, url) = fake_server("/publish");
+    let p = Publisher::connect(&url, publisher_config("pub-no-code", None)).unwrap();
+    let mut ws = accept(&listener);
+    write(&mut ws, &hello(Some("q7cJ9mV2xL0aR4tY")));
+    let code = wait_for(
+        || p.wait_event(WAIT),
+        |e| match e {
+            PublisherEvent::Error { code, .. } => Some(code),
+            _ => None,
+        },
+    );
+    assert_eq!(code, ErrorCode::PairingRequired);
+}
+
+#[test]
 fn null_and_long_origins_are_refused_cleanly() {
     let relay = relay(None, &[]);
     // `null` is always refused, and the app is never asked about it (clause 14.5).

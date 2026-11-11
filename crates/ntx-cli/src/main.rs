@@ -231,9 +231,14 @@ fn publish(args: &PublishArgs) -> CliResult {
         PublisherEvent::Connected { relay, .. } => format!("connected to relay \"{}\"", relay.name),
         PublisherEvent::Tally(tally) => describe_tally(tally),
         PublisherEvent::Error { code, message } => {
-            format!("relay error: {} {}", code.as_str(), message.unwrap_or_default())
+            let then = if code.needs_user() { " (not retrying)" } else { "" };
+            format!(
+                "relay error: {} {}{then}",
+                code.as_str(),
+                message.unwrap_or_default()
+            )
         }
-        PublisherEvent::Disconnected { reason } => format!("disconnected: {reason} (retrying)"),
+        PublisherEvent::Disconnected { reason } => format!("disconnected: {reason}"),
     };
     reporting(
         |t| publisher.wait_event(t),
@@ -388,9 +393,14 @@ fn recv(args: &RecvArgs) -> CliResult {
                 println!("{line}");
             }
             Some(ReceiverEvent::Error { code, message }) => {
-                eprintln!("source error: {} {}", code.as_str(), message.unwrap_or_default());
+                let error = format!("source error: {} {}", code.as_str(), message.unwrap_or_default());
+                // Trying again cannot help until the settings change (clause 11.3).
+                if code.needs_user() {
+                    return Err(error.into());
+                }
+                eprintln!("{error}");
             }
-            Some(ReceiverEvent::Disconnected { reason }) => eprintln!("disconnected: {reason} (retrying)"),
+            Some(ReceiverEvent::Disconnected { reason }) => eprintln!("disconnected: {reason}"),
             None => {}
         }
     }

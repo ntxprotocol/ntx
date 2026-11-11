@@ -354,3 +354,137 @@ fn repeated_wrong_pairing_codes_lock_the_address_out() {
         "{locked}"
     );
 }
+
+/// Whether a client connects to the fake server within `within`.
+fn connects_within(listener: &std::net::TcpListener, within: Duration) -> bool {
+    listener.set_nonblocking(true).unwrap();
+    let deadline = std::time::Instant::now() + within;
+    let connected = loop {
+        match listener.accept() {
+            Ok(_) => break true,
+            Err(_) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            Err(_) => break false,
+        }
+    };
+    listener.set_nonblocking(false).unwrap();
+    connected
+}
+
+fn next_error(r: &Receiver) -> ErrorCode {
+    wait_for(
+        || r.wait_event(WAIT),
+        |e| match e {
+            ReceiverEvent::Error { code, .. } => Some(code),
+            _ => None,
+        },
+    )
+}
+
+#[test]
+fn connected_only_after_the_first_update() {
+    let (listener, url) = fake_server("/");
+    let r = Receiver::connect(&url, receiver_config(&["program", "preview", "nope"], None)).unwrap();
+    let mut ws = accept(&listener);
+    let mut greeting = hello("0.1");
+    greeting["channels"] = json!(["program", "preview"]);
+    write(&mut ws, &greeting);
+    // Only channels the source listed are asked for (clause 8.3).
+    assert_eq!(read(&mut ws)["channels"], json!(["program", "preview"]));
+    write(
+        &mut ws,
+        &json!({"op": "announce", "types": [{"ntxType": "com.example.t", "schema": {"type": "object"}}]}),
+    );
+    assert_eq!(r.wait_event(Duration::from_millis(300)), None);
+    // The first update confirms the subscription; the announcement waited for it.
+    write(
+        &mut ws,
+        &json!({"op": "update", "channel": "program", "seq": 0, "type": "ntx.text", "fields": {}}),
+    );
+    let events: Vec<_> = (0..3).filter_map(|_| r.wait_event(WAIT)).collect();
+    assert!(matches!(events[0], ReceiverEvent::Connected { .. }), "{events:?}");
+    assert!(matches!(events[1], ReceiverEvent::Announce(_)), "{events:?}");
+    assert!(matches!(events[2], ReceiverEvent::Update(_)), "{events:?}");
+}
+
+#[test]
+fn errors_that_need_the_user_stop_reconnecting() {
+    // Clause 11.3: pairing_failed (and the others) from the source...
+    let (listener, url) = fake_server("/");
+    let r = Receiver::connect(&url, receiver_config(&["program"], Some("1234"))).unwrap();
+    let mut ws = accept(&listener);
+    let mut greeting = hello("0.1");
+    greeting["pairing"] = json!({"nonce": "q7cJ9mV2xL0aR4tY"});
+    write(&mut ws, &greeting);
+    read(&mut ws);
+    write(&mut ws, &json!({"op": "error", "code": "pairing_failed"}));
+    drop(ws);
+    assert_eq!(next_error(&r), ErrorCode::PairingFailed);
+    disconnect_reason(&r);
+    assert!(!connects_within(&listener, Duration::from_millis(1500)));
+    // ...until the app asks to try again.
+    r.reconnect();
+    assert!(connects_within(&listener, WAIT));
+
+    // A receiver without a pairing code gives up with 4003 instead of subscribing (clause 8.3).
+    let (listener, url) = fake_server("/");
+    let r = Receiver::connect(&url, receiver_config(&["program"], None)).unwrap();
+    let mut ws = accept(&listener);
+    write(&mut ws, &greeting);
+    let close = loop {
+        if let WsMessage::Close(frame) = ws.read().unwrap() {
+            break frame.unwrap().code;
+        }
+    };
+    assert_eq!(u16::from(close), 4003);
+    assert_eq!(next_error(&r), ErrorCode::PairingRequired);
+    assert!(!connects_within(&listener, Duration::from_millis(1500)));
+
+    // So does a version this receiver does not speak.
+    let (listener, url) = fake_server("/");
+    let r = Receiver::connect(&url, receiver_config(&["program"], None)).unwrap();
+    write(&mut accept(&listener), &hello("0.2"));
+    assert_eq!(next_error(&r), ErrorCode::UnsupportedVersion);
+    assert!(!connects_within(&listener, Duration::from_millis(1500)));
+}
+
+#[test]
+fn the_wait_goes_back_to_one_second_only_after_an_update() {
+    let (listener, url) = fake_server("/");
+    let _r = Receiver::connect(&url, receiver_config(&["program"], None)).unwrap();
+    // Accepts the next connection, answers its subscribe, and says how long it took to come.
+    let next = |since: std::time::Instant| {
+        let mut ws = accept(&listener);
+        let waited = since.elapsed();
+        write(&mut ws, &hello("0.1"));
+        read(&mut ws);
+        (ws, waited)
+    };
+    let (ws, _) = next(std::time::Instant::now());
+    // Closed before any update: the waits are 1 second, then 2 (clause 11.3).
+    drop(ws);
+    let (ws, first) = next(std::time::Instant::now());
+    drop(ws);
+    let (mut ws, second) = next(std::time::Instant::now());
+    assert!(first < Duration::from_millis(1800), "{first:?}");
+    assert!(second >= Duration::from_millis(1800), "{second:?}");
+    // This connection delivers an update: the next wait is 1 second again.
+    write(
+        &mut ws,
+        &json!({"op": "update", "channel": "program", "seq": 1, "type": "ntx.text", "fields": {}}),
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    drop(ws);
+    let (_ws, third) = next(std::time::Instant::now());
+    assert!(third < Duration::from_millis(1800), "{third:?}");
+}
+
+#[test]
+fn reconnect_connects_again_when_reconnecting_is_off() {
+    let (listener, url) = fake_server("/");
+    let r = one_shot_receiver(&url);
+    drop(accept(&listener));
+    disconnect_reason(&r);
+    assert!(!connects_within(&listener, Duration::from_millis(1500)));
+    r.reconnect();
+    assert!(connects_within(&listener, WAIT));
+}
