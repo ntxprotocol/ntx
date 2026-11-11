@@ -1,0 +1,98 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Tests (including surface tests) on every supported platform.
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out the spec (for its example messages)
+        uses: actions/checkout@v4
+        with:
+          repository: ntxprotocol/spec
+          path: spec
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+        env:
+          NTX_SPEC_DIR: ${{ github.workspace }}/spec
+
+  # The same checks as the local pre-commit and pre-push hooks: format, lint, coverage >= 90%,
+  # docs, licences and advisories, unused dependencies, duplicated code, secrets.
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out the spec (for its example messages)
+        uses: actions/checkout@v4
+        with:
+          repository: ntxprotocol/spec
+          path: spec
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt, llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov,cargo-deny,cargo-machete
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: pre-commit/action@v3.0.1
+        env:
+          NTX_SPEC_DIR: ${{ github.workspace }}/spec
+        with:
+          extra_args: --all-files --hook-stage pre-push
+      - uses: pre-commit/action@v3.0.1
+        with:
+          extra_args: --all-files --hook-stage pre-commit
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.87
+      - run: cargo check --workspace --all-targets --locked
+
+  commits:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Every commit is signed off (DCO) and follows Conventional Commits
+        env:
+          RANGE: ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
+        run: |
+          status=0
+          pattern='^(build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)(\([a-z0-9-]+\))?!?: .+'
+          for sha in $(git rev-list "$RANGE"); do
+            message=$(git log -1 --format=%B "$sha")
+            if ! grep -q '^Signed-off-by: ' <<< "$message"; then
+              echo "::error::$sha has no Signed-off-by line (use git commit -s)"; status=1
+            fi
+            if ! head -1 <<< "$message" | grep -Eq "$pattern"; then
+              echo "::error::$sha subject is not a Conventional Commit: $(head -1 <<< "$message")"; status=1
+            fi
+          done
+          exit $status

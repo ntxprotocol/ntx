@@ -1,0 +1,179 @@
+//! Turning fields into display text (spec clause 16).
+//!
+//! ```
+//! use ntx::binding::Pattern;
+//! let fields = serde_json::json!({"reference": "John 3:16", "version": "KJV"});
+//! let pattern = Pattern::parse("{reference} · {version}").unwrap();
+//! assert_eq!(pattern.render(fields.as_object().unwrap()), "John 3:16 · KJV");
+//! ```
+
+use serde_json::Value;
+
+use crate::{Error, Fields, Result};
+
+/// Finds the value at a dot-separated field path such as `verses.0.text` (clause 16.2).
+#[must_use]
+pub fn lookup<'a>(fields: &'a Fields, path: &str) -> Option<&'a Value> {
+    let mut parts = path.split('.');
+    let mut value = fields.get(parts.next()?)?;
+    for part in parts {
+        value = match value {
+            Value::Object(map) => map.get(part)?,
+            Value::Array(items) => items.get(parse_index(part)?)?,
+            _ => return None,
+        };
+    }
+    Some(value)
+}
+
+fn parse_index(part: &str) -> Option<usize> {
+    if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    part.parse().ok()
+}
+
+/// Converts a value to display text (clause 16.4).
+#[must_use]
+pub fn to_text(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Null | Value::Object(_) => String::new(),
+        Value::Array(items) => items.iter().map(to_text).collect::<Vec<_>>().join("\n"),
+    }
+}
+
+/// The text for one field path: empty when the path is not found.
+#[must_use]
+pub fn field_text(fields: &Fields, path: &str) -> String {
+    lookup(fields, path).map(to_text).unwrap_or_default()
+}
+
+/// A text pattern such as `{reference} · {version}` (clause 16.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pattern {
+    parts: Vec<Part>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Part {
+    Text(String),
+    Field(String),
+}
+
+impl Pattern {
+    /// Parses a pattern. `{{` and `}}` are literal braces.
+    ///
+    /// # Errors
+    ///
+    /// Fails for an unclosed or empty `{}`, or a lone `}`.
+    pub fn parse(pattern: &str) -> Result<Pattern> {
+        let mut parts = Vec::new();
+        let mut text = String::new();
+        let mut chars = pattern.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '{' if chars.peek() == Some(&'{') => {
+                    chars.next();
+                    text.push('{');
+                }
+                '}' if chars.peek() == Some(&'}') => {
+                    chars.next();
+                    text.push('}');
+                }
+                '{' => {
+                    let mut path = String::new();
+                    loop {
+                        match chars.next() {
+                            Some('}') => break,
+                            Some('{') | None => {
+                                return Err(Error::InvalidPattern(format!("unclosed \"{{\" in {pattern:?}")));
+                            }
+                            Some(c) => path.push(c),
+                        }
+                    }
+                    let path = path.trim().to_string();
+                    if path.is_empty() {
+                        return Err(Error::InvalidPattern(format!("empty \"{{}}\" in {pattern:?}")));
+                    }
+                    if !text.is_empty() {
+                        parts.push(Part::Text(std::mem::take(&mut text)));
+                    }
+                    parts.push(Part::Field(path));
+                }
+                '}' => return Err(Error::InvalidPattern(format!("unexpected \"}}\" in {pattern:?}"))),
+                c => text.push(c),
+            }
+        }
+        if !text.is_empty() {
+            parts.push(Part::Text(text));
+        }
+        Ok(Pattern { parts })
+    }
+
+    /// Fills in the pattern from `fields`.
+    #[must_use]
+    pub fn render(&self, fields: &Fields) -> String {
+        self.parts
+            .iter()
+            .map(|p| match p {
+                Part::Text(t) => t.clone(),
+                Part::Field(path) => field_text(fields, path),
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn fields() -> Fields {
+        json!({
+            "reference": "John 3:16",
+            "version": "KJV",
+            "verses": [{"number": 16, "text": "For God so loved the world"}],
+            "lines": ["one", "two", 3],
+            "on": true,
+            "nothing": null,
+            "obj": {"a": 1}
+        })
+        .as_object()
+        .unwrap()
+        .clone()
+    }
+
+    #[test]
+    fn paths() {
+        let f = fields();
+        assert_eq!(field_text(&f, "reference"), "John 3:16");
+        assert_eq!(field_text(&f, "verses.0.text"), "For God so loved the world");
+        assert_eq!(field_text(&f, "verses.0.number"), "16");
+        assert_eq!(field_text(&f, "verses.1.text"), "");
+        assert_eq!(field_text(&f, "verses.+0.text"), "");
+        assert_eq!(field_text(&f, "missing"), "");
+        assert_eq!(field_text(&f, "lines"), "one\ntwo\n3");
+        assert_eq!(field_text(&f, "on"), "true");
+        assert_eq!(field_text(&f, "nothing"), "");
+        assert_eq!(field_text(&f, "obj"), "");
+        assert_eq!(field_text(&Fields::new(), "text"), "");
+    }
+
+    #[test]
+    fn patterns() {
+        let f = fields();
+        let p = Pattern::parse("{reference} · {version}").unwrap();
+        assert_eq!(p.render(&f), "John 3:16 · KJV");
+        assert_eq!(
+            Pattern::parse("{{literal}} {version}").unwrap().render(&f),
+            "{literal} KJV"
+        );
+        assert_eq!(Pattern::parse("{ reference }").unwrap().render(&f), "John 3:16");
+        for bad in ["{reference", "{}", "a } b", "{a{b}}"] {
+            assert!(Pattern::parse(bad).is_err(), "{bad}");
+        }
+    }
+}

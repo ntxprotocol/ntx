@@ -1,0 +1,94 @@
+# Checks before commit and push. See https://github.com/ntxprotocol/.github/blob/main/CODE_STANDARDS.md
+# Install once:  pre-commit install
+# Run all:       pre-commit run --all-files --hook-stage pre-push
+default_install_hook_types: [pre-commit, commit-msg, pre-push]
+default_stages: [pre-commit]
+
+repos:
+  # Shared by every NTX repository: file hygiene, secrets, commit messages.
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+      - id: detect-private-key
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v4.5.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
+  - repo: local
+    hooks:
+      - id: dco-sign-off
+        name: DCO sign-off (git commit -s)
+        language: pygrep
+        entry: '^Signed-off-by: .+ <.+@.+>'
+        args: [--negate]
+        stages: [commit-msg]
+
+  # Rust: fast checks before every commit, full checks before every push.
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        language: system
+        entry: cargo fmt --all --check
+        types: [rust]
+        pass_filenames: false
+      - id: cargo-clippy
+        name: cargo clippy (pedantic, warnings are errors)
+        language: system
+        entry: cargo clippy --workspace --all-targets --locked -- -D warnings
+        types_or: [rust, toml]
+        pass_filenames: false
+      - id: tests-and-coverage
+        name: tests incl. surface tests, line coverage >= 90%
+        language: system
+        entry: cargo llvm-cov --workspace --locked --fail-under-lines 90
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+      - id: cargo-doc
+        name: cargo doc (no broken docs)
+        language: system
+        entry: env RUSTDOCFLAGS=-Dwarnings cargo doc --workspace --no-deps --locked
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+      - id: cargo-deny
+        name: cargo deny (licences, advisories, sources)
+        language: system
+        entry: cargo deny --locked check
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+      - id: cargo-machete
+        name: cargo machete (unused dependencies)
+        language: system
+        entry: cargo machete
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+  - repo: local
+    hooks:
+      - id: no-duplicate-code
+        name: jscpd (no copy-pasted code)
+        language: node
+        language_version: system
+        additional_dependencies: [jscpd@4.0.5]
+        entry: jscpd crates --min-lines 6 --min-tokens 60 --threshold 0 --reporters console --silent
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]

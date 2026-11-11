@@ -1,0 +1,105 @@
+//! Helpers shared by the integration tests.
+#![allow(dead_code, unreachable_pub)] // each test file uses a different subset
+
+use std::net::{IpAddr, Ipv4Addr, TcpStream};
+use std::time::Duration;
+
+use ntx::{Receiver, ReceiverConfig, ReceiverEvent, Source, SourceConfig, Update};
+use serde_json::Value;
+use tungstenite::client::IntoClientRequest;
+use tungstenite::stream::MaybeTlsStream;
+use tungstenite::{Message as WsMessage, WebSocket};
+
+pub const WAIT: Duration = Duration::from_secs(5);
+
+/// A source on localhost with `program` and `preview`, not advertised.
+pub fn source(pairing: Option<&str>) -> Source {
+    let mut config = SourceConfig::new("TEST (source)");
+    config.bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    config.port = 0;
+    config.advertise = false;
+    config.channels.push(ntx::PREVIEW.into());
+    config.pairing_code = pairing.map(String::from);
+    Source::start(config).unwrap()
+}
+
+pub fn receiver_config(channels: &[&str], pairing: Option<&str>) -> ReceiverConfig {
+    let mut config = ReceiverConfig::new("TEST (receiver)");
+    config.channels = channels.iter().map(ToString::to_string).collect();
+    config.pairing_code = pairing.map(String::from);
+    config
+}
+
+pub fn receiver(source: &Source, channels: &[&str], pairing: Option<&str>) -> Receiver {
+    Receiver::connect(
+        &format!("ws://{}/", source.local_addr()),
+        receiver_config(channels, pairing),
+    )
+    .unwrap()
+}
+
+/// Waits for the next update, skipping other events.
+pub fn next_update(r: &Receiver) -> Update {
+    loop {
+        match r.wait_event(WAIT).expect("timed out waiting for an update") {
+            ReceiverEvent::Update(update) => return update,
+            ReceiverEvent::Disconnected { reason } => panic!("disconnected: {reason}"),
+            _ => {}
+        }
+    }
+}
+
+/// Waits for the first event that `pick` accepts.
+pub fn wait_for<E, T>(mut next: impl FnMut() -> Option<E>, mut pick: impl FnMut(E) -> Option<T>) -> T {
+    loop {
+        if let Some(found) = pick(next().expect("timed out")) {
+            return found;
+        }
+    }
+}
+
+pub fn text(update: &Update) -> &str {
+    update.fields.get("text").and_then(Value::as_str).unwrap_or("")
+}
+
+pub type Raw = WebSocket<MaybeTlsStream<TcpStream>>;
+
+/// A raw WebSocket client offering the `ntx` subprotocol.
+pub fn raw_connect(url: &str) -> Raw {
+    let mut request = url.into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("sec-websocket-protocol", "ntx".parse().unwrap());
+    let (ws, response) = tungstenite::connect(request).unwrap();
+    assert_eq!(response.headers().get("sec-websocket-protocol").unwrap(), "ntx");
+    if let MaybeTlsStream::Plain(stream) = ws.get_ref() {
+        stream.set_read_timeout(Some(WAIT)).unwrap();
+    }
+    ws
+}
+
+pub fn send_json(ws: &mut Raw, value: &Value) {
+    ws.send(WsMessage::text(value.to_string())).unwrap();
+}
+
+/// Reads the next text message as JSON.
+pub fn read_json(ws: &mut Raw) -> Value {
+    loop {
+        match ws.read().expect("read failed") {
+            WsMessage::Text(text) => return serde_json::from_str(&text).unwrap(),
+            WsMessage::Close(frame) => panic!("closed: {frame:?}"),
+            _ => {}
+        }
+    }
+}
+
+/// Reads until the close frame and returns its code.
+pub fn read_close(ws: &mut Raw) -> u16 {
+    loop {
+        match ws.read() {
+            Ok(WsMessage::Close(frame)) => return frame.map_or(1005, |f| f.code.into()),
+            Ok(_) => {}
+            Err(e) => panic!("no close frame: {e}"),
+        }
+    }
+}
