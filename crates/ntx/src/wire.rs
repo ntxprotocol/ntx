@@ -32,6 +32,9 @@ const PING_AFTER: Duration = Duration::from_secs(5);
 /// Give up when nothing has been received for this long (clause 11.2).
 const DEAD_AFTER: Duration = Duration::from_secs(15);
 
+/// Close code for a timeout (clause 12.5): no `subscribe` in time, or a silent peer.
+const TIMEOUT_CLOSE: u16 = 4008;
+
 /// How long the first message of a handshake may take (clause 8.6).
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -464,10 +467,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Peer<S> {
         }
     }
 
-    /// Call every [`HEARTBEAT_INTERVAL`]: pings a quiet peer and gives up on a silent one.
+    /// Call every [`HEARTBEAT_INTERVAL`]: pings a quiet peer and closes the connection to a
+    /// silent one (clause 11.2).
     pub(crate) async fn heartbeat(&mut self) -> Result<(), Ended> {
         if self.last_received.elapsed() >= DEAD_AFTER {
-            return Err(Ended("no answer from peer".into()));
+            let reason = "nothing received for 15 seconds";
+            self.close(Some((TIMEOUT_CLOSE, reason))).await;
+            return Err(Ended(format!("no answer from peer: {reason}")));
         }
         if self.last_received.elapsed() >= PING_AFTER && self.last_ping.elapsed() >= PING_AFTER {
             self.pings += 1;
@@ -557,9 +563,12 @@ pub(crate) async fn greet<T>(
         peer.handshake_done();
         Ok(answer)
     };
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, greeting)
-        .await
-        .unwrap_or_else(|_| Err(Ended("no answer to hello".into())))
+    if let Ok(greeted) = tokio::time::timeout(HANDSHAKE_TIMEOUT, greeting).await {
+        return greeted;
+    }
+    let reason = "no answer to hello within 10 seconds";
+    peer.close(Some((TIMEOUT_CLOSE, reason))).await;
+    Err(Ended(reason.into()))
 }
 
 /// Checks the version and pairing proof of a `subscribe` or `publish` (clauses 13.4, 19.3).

@@ -248,7 +248,16 @@ fn receiver_pings_a_quiet_source_and_gives_up_on_a_silent_one() {
     // Say nothing: the receiver pings after 5 seconds (clause 11.1).
     let ping = read(&mut ws);
     assert_eq!(ping["op"], "ping");
-    // Keep ignoring it: the receiver gives up after 15 seconds (clause 11.2).
+    // Keep ignoring it: after 15 seconds the receiver closes with 4008 (clauses 11.2, 12.5).
+    ws.get_ref()
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    let close = loop {
+        if let WsMessage::Close(frame) = ws.read().unwrap() {
+            break frame.unwrap().code;
+        }
+    };
+    assert_eq!(u16::from(close), 4008);
     let reason = wait_for(
         || r.wait_event(Duration::from_secs(20)),
         |e| match e {
@@ -257,6 +266,18 @@ fn receiver_pings_a_quiet_source_and_gives_up_on_a_silent_one() {
         },
     );
     assert!(reason.contains("no answer"), "{reason}");
+}
+
+#[test]
+fn source_closes_with_4008_without_subscribe_or_when_the_receiver_is_silent() {
+    let s = source(None);
+    // No subscribe within 10 seconds (clause 8.6).
+    let mut quiet = raw_connect(&format!("ws://{}/", s.local_addr()));
+    assert_eq!(read_json(&mut quiet)["op"], "hello");
+    // A receiver that answers nothing, not even pings, for 15 seconds (clause 11.2).
+    let mut silent = subscribed(&s);
+    assert_eq!(read_close(&mut quiet), 4008);
+    assert_eq!(read_close(&mut silent), 4008);
 }
 
 #[test]
