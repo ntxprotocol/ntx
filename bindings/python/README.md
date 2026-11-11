@@ -1,11 +1,26 @@
+<!-- markdownlint-disable-file MD041 -- the logo comes before the title -->
+<!-- markdownlint-disable MD033 -->
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="../../assets/ntx-lockup-reverse.svg">
+    <img src="../../assets/ntx-lockup.svg" alt="NTX — Network Text Exchange" height="64">
+  </picture>
+</p>
+<!-- markdownlint-enable MD033 -->
+
 # ntx-protocol
+
+[![ci](https://github.com/ntxprotocol/ntx/actions/workflows/ci.yml/badge.svg)](https://github.com/ntxprotocol/ntx/actions/workflows/ci.yml)
+[![Coverage target: at least 90%](https://img.shields.io/badge/coverage%20target-%E2%89%A590%25-0B7A72)](https://github.com/ntxprotocol/.github/blob/main/CODE_STANDARDS.md)
+[![Licence: MIT OR Apache-2.0](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-0B7A72)](#licence)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-0B7A72)](https://www.python.org)
 
 Python bindings for **NTX (Network Text Exchange)**, an open protocol for sending text, not
 video, between apps on a local network. A source sends structured text (a type name plus JSON
 fields) and each receiver shows it with its own templates.
 
 > **Status: early development**, following the NTX 0.1 Pre-Draft
-> [specification](https://github.com/ntxprotocol/spec). APIs will change. Not on PyPI yet.
+> [specification](https://github.com/ntxprotocol/spec/blob/main/ntx.md). APIs will change. Not on PyPI yet.
 
 - Distribution: `ntx-protocol`. Import: `ntxprotocol`.
 - Python 3.9 or newer (one `abi3` wheel per platform), on Linux, macOS and Windows.
@@ -14,11 +29,34 @@ fields) and each receiver shows it with its own templates.
 
 ## Install from source
 
-You need [Rust](https://rustup.rs) 1.87 or newer.
+You need Python 3.9 or newer, Git and [Rust](https://rustup.rs) 1.87 or newer.
 
-```bash
-pip install ./bindings/python
-```
+1. Get the code:
+
+   ```bash
+   git clone https://github.com/ntxprotocol/ntx.git
+   cd ntx
+   ```
+
+2. Make a virtual environment and turn it on. On macOS and Linux:
+
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   ```
+
+   On Windows:
+
+   ```powershell
+   python -m venv .venv
+   .venv\Scripts\activate
+   ```
+
+3. Install the package (this compiles the Rust code, so the first time takes a few minutes):
+
+   ```bash
+   pip install ./bindings/python
+   ```
 
 ## Send and receive
 
@@ -42,6 +80,7 @@ with ntx.Receiver("192.168.1.20", "MEDIA-PC (Display)") as receiver:
 ```
 
 A complete example that runs on one computer is in [`examples/hello.py`](examples/hello.py).
+Run it from the repository root with `python bindings/python/examples/hello.py`.
 
 ## Find sources
 
@@ -64,7 +103,7 @@ with ntx.Browser() as browser:
 | Events | Frozen dataclasses, read with `poll_event()` or `wait_event(timeout)` (`math.inf` waits with no limit). No callbacks |
 | Threads | Waiting releases the GIL and Ctrl-C interrupts it. Objects may be shared; `close()` from another thread ends a wait with `ClosedError` |
 | Errors | Exceptions derived from `NtxError`, e.g. `UnknownChannelError`, `ClosedError` |
-| Binding | `render(fields, "{reference} · {version}")` turns fields into text (clause 16) |
+| Binding | `render(fields, "{reference} · {version}")` turns fields into text ([clause 16](https://github.com/ntxprotocol/spec/blob/main/ntx.md#16-binding-fields-to-display-elements)) |
 
 Events by object:
 
@@ -80,10 +119,10 @@ Receivers can tell the source whether its text is on air with
 
 ## Develop
 
-From the repository root:
+From the repository root, with the virtual environment from [Install from source](#install-from-source)
+turned on (`source .venv/bin/activate`, or `.venv\Scripts\activate` on Windows):
 
 ```bash
-python -m venv .venv && . .venv/bin/activate
 pip install maturin mypy pytest pytest-cov
 cd bindings/python
 maturin develop

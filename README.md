@@ -99,7 +99,7 @@ while let Some(event) = receiver.wait_event(Duration::from_secs(5)) {
 
 Everything networked runs on a background thread. Events are **queued and read with
 `poll_event` / `wait_event`**, never pushed through callbacks, so the same design works from C,
-Python, Node, Java and .NET.
+Python (PyO3), Node, Java and .NET.
 
 ## Development
 

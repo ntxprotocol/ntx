@@ -1,6 +1,6 @@
 """Sends text from a source to a receiver on this computer, and renders a binding pattern.
 
-Run it with:  python examples/hello.py
+Run it from the repository root with:  python bindings/python/examples/hello.py
 """
 
 import ntxprotocol as ntx
