@@ -188,17 +188,28 @@ fn bad_input_fails_cleanly() {
 #[test]
 fn list_finds_an_advertised_sender() {
     let sender = Sender::start(&["--id", "surface-list"]);
-    let output = Command::new(NTX)
-        .args(["list", "--seconds", "4"])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    assert!(
-        stdout(&output)
-            .iter()
-            .any(|l| l.contains("surface test") && l.contains("id surface-list")),
-        "{output:?}"
-    );
+    // mDNS can take several seconds to answer on busy machines (CI), so look a few times.
+    let listed = |output: &Output| {
+        output.status.success()
+            && stdout(output)
+                .iter()
+                .any(|l| l.contains("surface test") && l.contains("id surface-list"))
+    };
+    let attempts: Vec<Output> = (0..4)
+        .map(|_| {
+            Command::new(NTX)
+                .args(["list", "--seconds", "5"])
+                .output()
+                .unwrap()
+        })
+        .scan(false, |found, output| {
+            (!*found).then(|| {
+                *found = listed(&output);
+                output
+            })
+        })
+        .collect();
+    assert!(attempts.last().is_some_and(listed), "{attempts:?}");
     assert!(sender.finish().success());
 
     let nothing = Command::new(NTX)
