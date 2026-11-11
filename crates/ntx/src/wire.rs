@@ -181,7 +181,7 @@ pub(crate) fn frame(message: &Message) -> crate::Result<WsMessage> {
 
 /// Runs a connection after its handshake until it ends: sends queued frames, passes received
 /// messages to `handle`, keeps the heartbeat (clause 11) and closes when `stop` completes.
-pub(crate) async fn pump<S: AsyncRead + AsyncWrite + Unpin>(
+pub(crate) async fn pump<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     peer: &mut Peer<S>,
     out: &mut mpsc::UnboundedReceiver<WsMessage>,
     stop: impl Future<Output = ()>,
@@ -213,9 +213,12 @@ pub(crate) async fn pump<S: AsyncRead + AsyncWrite + Unpin>(
 pub(crate) struct Ended(pub(crate) String);
 
 /// One WebSocket connection speaking NTX.
-pub(crate) struct Peer<S> {
+pub(crate) struct Peer<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> {
     sink: SplitSink<WebSocketStream<S>, WsMessage>,
-    stream: SplitStream<WebSocketStream<S>>,
+    /// Always present; taken only when the peer is dropped.
+    stream: Option<SplitStream<WebSocketStream<S>>>,
+    /// A close frame has been sent.
+    closing: bool,
     last_received: Instant,
     last_ping: Instant,
     pings: u64,
@@ -223,12 +226,13 @@ pub(crate) struct Peer<S> {
     handshake: Option<&'static str>,
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin> Peer<S> {
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Peer<S> {
     pub(crate) fn new(ws: WebSocketStream<S>, handshake: &'static str) -> Self {
         let (sink, stream) = ws.split();
         Peer {
             sink,
-            stream,
+            stream: Some(stream),
+            closing: false,
             last_received: Instant::now(),
             last_ping: Instant::now(),
             pings: 0,
@@ -270,27 +274,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Peer<S> {
         self.close_with(WsMessage::Close(None)).await;
     }
 
-    /// Sends `close` and waits briefly for the peer to close too. Dropping a socket with unread
-    /// data resets the connection on some systems (Windows), and the peer would lose the last
-    /// messages, such as an `error`, before reading them.
+    /// Sends `close`. When the peer is dropped, it waits for the peer to close too.
     async fn close_with(&mut self, close: WsMessage) {
-        if self.send_frame(close).await.is_ok() {
-            let drain = async {
-                while let Some(Ok(frame)) = self.stream.next().await {
-                    if frame.is_close() {
-                        break;
-                    }
-                }
-            };
-            let _ = tokio::time::timeout(CLOSE_TIMEOUT, drain).await;
-        }
+        self.closing = self.send_frame(close).await.is_ok();
     }
 
     /// Returns the next NTX message. Pings are answered and unknown ops skipped (clause 7.2).
     /// Invalid messages are answered with `bad_message`, or end a handshake.
     pub(crate) async fn recv(&mut self) -> Result<Message, Ended> {
         loop {
-            let frame = match self.stream.next().await {
+            let stream = self.stream.as_mut().expect("present until dropped");
+            let frame = match stream.next().await {
                 Some(Ok(frame)) => frame,
                 Some(Err(e)) => return Err(Ended(e.to_string())),
                 None => return Err(Ended("connection closed".into())),
@@ -344,6 +338,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Peer<S> {
             .await?;
         }
         Ok(())
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Drop for Peer<S> {
+    /// After a close, reads until the peer closes too. Dropping a socket with unread data resets
+    /// the connection on some systems (Windows), and the peer would lose its last messages, such
+    /// as an `error`. This runs on its own task, so nothing can cancel it halfway.
+    fn drop(&mut self) {
+        let Some(mut stream) = self.stream.take().filter(|_| self.closing) else {
+            return;
+        };
+        runtime().spawn(async move {
+            let drain = async {
+                while let Some(Ok(frame)) = stream.next().await {
+                    if frame.is_close() {
+                        break;
+                    }
+                }
+            };
+            let _ = tokio::time::timeout(CLOSE_TIMEOUT, drain).await;
+        });
     }
 }
 
