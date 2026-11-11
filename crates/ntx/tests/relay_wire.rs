@@ -26,7 +26,9 @@ fn url(relay: &Relay) -> String {
 fn published(relay: &Relay, origin: Option<&str>) -> (Raw, u16) {
     let mut ws = raw_connect_from(&url(relay), origin);
     assert_eq!(read_json(&mut ws)["op"], "hello");
-    send_json(&mut ws, &publish("0.1"));
+    let mut message = publish("0.1");
+    message["source"]["id"] = origin.unwrap_or("native").into(); // one source per publisher
+    send_json(&mut ws, &message);
     let port = wait_for(
         || relay.wait_event(WAIT),
         |e| match e {
@@ -122,14 +124,16 @@ fn origins_are_refused_until_allowed() {
     );
     assert_eq!(relay.wait_event(Duration::from_millis(200)), None);
 
-    relay.allow_origin(PAGE);
+    // Allow-list entries and origins are compared in normal form.
+    relay.allow_origin("HTTPS://Songs.Example:443/").unwrap();
     let (mut ws, _) = published(&relay, Some(PAGE));
     let (_trusted, _) = published(&relay, Some("https://trusted.example"));
     let (_native, _) = published(&relay, None);
 
-    // Withdrawing the permission disconnects the page's publisher only.
-    relay.revoke_origin(PAGE);
-    read_close(&mut ws);
+    // Withdrawing the permission disconnects the page's publisher only, with `not_allowed`.
+    relay.revoke_origin(PAGE).unwrap();
+    assert_eq!(read_json(&mut ws)["code"], "not_allowed");
+    assert_eq!(read_close(&mut ws), 4003);
     let left = wait_for(
         || relay.wait_event(WAIT),
         |e| match e {
@@ -237,4 +241,39 @@ fn publisher_reports_a_refusal() {
         },
     );
     assert!(reason.contains("not_allowed"), "{reason}");
+}
+
+#[test]
+fn null_and_long_origins_are_refused_cleanly() {
+    let relay = relay(None, &[]);
+    // `null` is always refused, and the app is never asked about it (clause 14.5).
+    let mut ws = raw_connect_from(&url(&relay), Some("null"));
+    assert_eq!(read_json(&mut ws)["code"], "not_allowed");
+    assert_eq!(read_close(&mut ws), 4003);
+    assert_eq!(relay.wait_event(Duration::from_millis(200)), None);
+
+    // The close reason must fit in a close frame (125 bytes); the error keeps the whole origin.
+    let long = format!("https://{}.example", "a".repeat(200));
+    let mut ws = raw_connect_from(&url(&relay), Some(&long));
+    let error = read_json(&mut ws);
+    assert!(error["message"].as_str().unwrap().contains(&long), "{error}");
+    assert_eq!(read_close(&mut ws), 4003);
+    assert_eq!(
+        relay.wait_event(WAIT),
+        Some(RelayEvent::OriginRequested { origin: long })
+    );
+}
+
+#[test]
+fn a_publisher_dropped_before_connecting_still_delivers() {
+    let (listener, url) = fake_server("/publish");
+    let p = Publisher::connect(&url, publisher_config("pub-early", None)).unwrap();
+    p.update_text("program", "hi").unwrap();
+    let dropping = std::thread::spawn(move || drop(p));
+    let mut ws = accept(&listener);
+    write(&mut ws, &hello(None));
+    assert_eq!(read(&mut ws)["op"], "publish");
+    let update = read(&mut ws);
+    assert_eq!(update["fields"]["text"], "hi");
+    dropping.join().unwrap();
 }

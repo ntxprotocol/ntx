@@ -65,8 +65,9 @@ cargo run -p ntx-cli -- relay --allow-origin https://example.com
 cargo run -p ntx-cli -- publish --name "Song Board"
 ```
 
-Web pages may publish only from origins allowed with `--allow-origin`. Programs that send no
-`Origin` header are always allowed. Publishing is off unless a relay runs.
+Web pages may publish only from origins allowed with `--allow-origin` (never from the origin
+`null`). Programs that send no `Origin` header may publish only from the same computer. Publishing
+is off unless a relay runs.
 
 ## Use the library
 

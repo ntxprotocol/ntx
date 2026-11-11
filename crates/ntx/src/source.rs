@@ -81,7 +81,8 @@ pub struct Source {
     events: Mutex<mpsc::Receiver<SourceEvent>>,
     local_addr: SocketAddr,
     stop: watch::Sender<bool>,
-    mdns: Option<(ServiceDaemon, String)>,
+    /// The mDNS daemon and the registered service name.
+    mdns: Option<(Arc<Mdns>, String)>,
 }
 
 struct Shared {
@@ -114,10 +115,20 @@ impl Source {
     ///
     /// Fails if the channels lack `program`, the port cannot be opened, or mDNS cannot start.
     pub fn start(config: SourceConfig) -> Result<Source> {
+        Source::start_with(config, None)
+    }
+
+    /// Like [`Source::start`], advertising with `mdns` when given instead of a daemon of its own.
+    pub(crate) fn start_with(config: SourceConfig, mdns: Option<Arc<Mdns>>) -> Result<Source> {
         let store = Store::new(config.channels.clone())?;
         let (listener, local_addr) = wire::listen(config.bind, config.port)?;
         let mdns = if config.advertise {
-            Some(advertise(&config, local_addr.port())?)
+            let daemon = match mdns {
+                Some(daemon) => daemon,
+                None => Arc::new(Mdns::new()?),
+            };
+            let fullname = advertise(&daemon.0, &config, local_addr.port())?;
+            Some((daemon, fullname))
         } else {
             None
         };
@@ -228,10 +239,9 @@ impl Drop for Source {
     fn drop(&mut self) {
         let _ = self.stop.send(true);
         if let Some((daemon, fullname)) = self.mdns.take() {
-            if let Ok(done) = daemon.unregister(&fullname) {
+            if let Ok(done) = daemon.0.unregister(&fullname) {
                 let _ = done.recv_timeout(Duration::from_secs(1));
             }
-            let _ = daemon.shutdown();
         }
     }
 }
@@ -244,10 +254,30 @@ pub fn display_name(name: &str) -> String {
     format!("{machine} ({name})")
 }
 
-/// Advertises the source with DNS-SD (clause 6).
-fn advertise(config: &SourceConfig, port: u16) -> Result<(ServiceDaemon, String)> {
-    let mdns = |e: mdns_sd::Error| Error::Mdns(e.to_string());
-    let daemon = ServiceDaemon::new().map_err(mdns)?;
+/// An mDNS daemon, shut down when its last user is dropped. A relay shares one between the
+/// sources it serves.
+pub(crate) struct Mdns(ServiceDaemon);
+
+impl Mdns {
+    pub(crate) fn new() -> Result<Mdns> {
+        Ok(Mdns(ServiceDaemon::new().map_err(mdns_error)?))
+    }
+}
+
+impl Drop for Mdns {
+    fn drop(&mut self) {
+        let _ = self.0.shutdown();
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)] // used with map_err
+fn mdns_error(e: mdns_sd::Error) -> Error {
+    Error::Mdns(e.to_string())
+}
+
+/// Registers the source with DNS-SD (clause 6). Returns the registered service name.
+fn advertise(daemon: &ServiceDaemon, config: &SourceConfig, port: u16) -> Result<String> {
+    let mdns = mdns_error;
     let host = gethostname::gethostname()
         .to_string_lossy()
         .trim_end_matches(".local")
@@ -275,18 +305,13 @@ fn advertise(config: &SourceConfig, port: u16) -> Result<(ServiceDaemon, String)
     .enable_addr_auto();
     let fullname = info.get_fullname().to_string();
     daemon.register(info).map_err(mdns)?;
-    Ok((daemon, fullname))
+    Ok(fullname)
 }
 
 /// Shortens a name to the 63-byte limit of a DNS label (clause 6.2), keeping whole characters.
 /// Longer names make mDNS answers empty, so nobody would find the source.
 fn dns_label(name: &str) -> &str {
-    const MAX: usize = 63;
-    let end = (0..=MAX.min(name.len()))
-        .rev()
-        .find(|&i| name.is_char_boundary(i))
-        .unwrap_or(0);
-    &name[..end]
+    wire::cut(name, 63)
 }
 
 /// Serves one receiver from WebSocket upgrade to disconnect.
@@ -324,6 +349,7 @@ async fn serve(stream: TcpStream, address: SocketAddr, shared: Arc<Shared>, mut 
     });
     let stopped = async move {
         let _ = stop.changed().await;
+        None
     };
     let ended = wire::pump(&mut peer, &mut out, stopped, |message| match message {
         Message::Tally(tally) => set_tally(&shared, connection, tally),

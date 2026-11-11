@@ -9,7 +9,7 @@ use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 
-use crate::protocol::{Endpoint, ErrorCode, Hello, Message, PairingProof, Publish, Subscribe};
+use crate::protocol::{Endpoint, ErrorCode, ErrorMessage, Hello, Message, PairingProof, Publish, Subscribe};
 use crate::wire::{self, Ended, HANDSHAKE_TIMEOUT, Peer};
 use crate::{DEFAULT_PORT, Error, PROTOCOL_VERSION, Result, SUBPROTOCOL, pairing};
 
@@ -102,8 +102,22 @@ impl Settings {
     }
 }
 
+/// Why a handshake failed.
+enum Failed {
+    /// The connection ended or could not be made.
+    Ended(Ended),
+    /// The other side sent `error` instead of `hello` (clause 14.5).
+    Refused(ErrorMessage),
+}
+
+impl From<Ended> for Failed {
+    fn from(ended: Ended) -> Self {
+        Failed::Ended(ended)
+    }
+}
+
 /// Connects, waits for `hello` and answers it (clauses 8 and 14.2).
-async fn handshake(settings: &Settings) -> std::result::Result<(Connection, Hello), Ended> {
+async fn handshake(settings: &Settings) -> std::result::Result<(Connection, Hello), Failed> {
     let connect = async {
         let (mut peer, hello, proof) = connect(&settings.url, settings.pairing_code.as_deref()).await?;
         peer.send(&settings.answer(proof)).await?;
@@ -112,13 +126,13 @@ async fn handshake(settings: &Settings) -> std::result::Result<(Connection, Hell
     };
     tokio::time::timeout(HANDSHAKE_TIMEOUT, connect)
         .await
-        .unwrap_or_else(|_| Err(Ended("no hello".into())))
+        .unwrap_or_else(|_| Err(Ended("no hello".into()).into()))
 }
 
 async fn connect(
     url: &str,
     pairing_code: Option<&str>,
-) -> std::result::Result<(Connection, Hello, Option<PairingProof>), Ended> {
+) -> std::result::Result<(Connection, Hello, Option<PairingProof>), Failed> {
     let mut request = url.into_client_request().map_err(|e| Ended(e.to_string()))?;
     request
         .headers_mut()
@@ -129,14 +143,16 @@ async fn connect(
     let mut peer = Peer::new(ws, "hello");
     let hello = match peer.recv().await? {
         Message::Hello(hello) => hello,
-        Message::Error(e) => {
-            let message = e.message.unwrap_or_default();
-            return Err(Ended(format!("refused: {} {message}", e.code.as_str())));
+        Message::Error(e) => return Err(Failed::Refused(e)),
+        _ => {
+            return Err(peer
+                .reject(ErrorCode::BadMessage, "expected hello".into())
+                .await
+                .into());
         }
-        _ => return Err(peer.reject(ErrorCode::BadMessage, "expected hello".into()).await),
     };
     if let Err((code, reason)) = wire::check_version(&hello.ntx) {
-        return Err(peer.reject(code, reason).await);
+        return Err(peer.reject(code, reason).await.into());
     }
     let proof = hello
         .pairing
@@ -148,26 +164,47 @@ async fn connect(
     Ok((peer, hello, proof))
 }
 
+/// What the owner of a receiver or publisher wants from its background task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Stop {
+    /// Keep connected.
+    Run,
+    /// Deliver what has not been sent yet, close cleanly, then stop.
+    Flush,
+    /// Stop at once.
+    Now,
+}
+
 /// A receiver or publisher that [`keep_connected`] connects again and again.
 pub(crate) trait Client: Send {
     fn settings(&self) -> &Settings;
 
-    /// Serves one connection after its handshake. Returns why it ended.
-    fn connected(&mut self, peer: Connection, hello: Hello) -> impl Future<Output = Ended> + Send;
+    /// Serves one connection after its handshake. Returns why it ended. `stop` changes when the
+    /// owner wants to stop; a connection that sees [`Stop::Flush`] finishes cleanly.
+    fn connected(
+        &mut self,
+        peer: Connection,
+        hello: Hello,
+        stop: watch::Receiver<Stop>,
+    ) -> impl Future<Output = Ended> + Send;
 
-    /// Reports a lost connection. Returns whether anyone still listens.
+    /// The other side refused the connection with `error` instead of `hello`.
+    fn refused(&mut self, error: ErrorMessage);
+
+    /// Reports a lost connection. Returns whether to connect again.
     fn disconnected(&mut self, reason: String) -> bool;
 }
 
 /// Connects, and reconnects with backoff (clause 11.3), until stopped.
-pub(crate) async fn keep_connected(mut client: impl Client, mut stop: watch::Receiver<bool>) {
+pub(crate) async fn keep_connected(mut client: impl Client, mut stop: watch::Receiver<Stop>) {
     let mut backoff = Duration::from_secs(1);
     loop {
         let (Ended(reason), handshook) = tokio::select! {
-            ended = connection(&mut client) => ended,
-            _ = stop.changed() => return,
+            ended = connection(&mut client, stop.clone()) => ended,
+            () = until(&mut stop, Stop::Now) => return,
         };
-        if !client.disconnected(reason) || !client.settings().reconnect {
+        let again = client.disconnected(reason);
+        if !again || !client.settings().reconnect || *stop.borrow() != Stop::Run {
             return;
         }
         if handshook {
@@ -175,17 +212,32 @@ pub(crate) async fn keep_connected(mut client: impl Client, mut stop: watch::Rec
         }
         tokio::select! {
             () = tokio::time::sleep(backoff) => {}
-            _ = stop.changed() => return,
+            // Flushing: try once more at once, then stop (checked above).
+            () = until(&mut stop, Stop::Flush) => if *stop.borrow() == Stop::Now { return },
         }
         backoff = (backoff * 2).min(Duration::from_secs(10));
     }
 }
 
+/// Waits until the owner asks for `at_least` (`Flush` also matches `Now`) or goes away.
+async fn until(stop: &mut watch::Receiver<Stop>, at_least: Stop) {
+    let _ = stop.wait_for(|s| *s == Stop::Now || *s == at_least).await;
+}
+
 /// One connection. Returns why it ended and whether its handshake had finished.
-async fn connection(client: &mut impl Client) -> (Ended, bool) {
+async fn connection(client: &mut impl Client, stop: watch::Receiver<Stop>) -> (Ended, bool) {
     match handshake(client.settings()).await {
-        Ok((peer, hello)) => (client.connected(peer, hello).await, true),
-        Err(ended) => (ended, false),
+        Ok((peer, hello)) => (client.connected(peer, hello, stop).await, true),
+        Err(Failed::Ended(ended)) => (ended, false),
+        Err(Failed::Refused(error)) => {
+            let reason = format!(
+                "refused: {} {}",
+                error.code.as_str(),
+                error.message.as_deref().unwrap_or_default()
+            );
+            client.refused(error);
+            (Ended(reason), false)
+        }
     }
 }
 

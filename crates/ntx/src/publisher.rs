@@ -4,8 +4,8 @@ use std::time::Duration;
 use tokio::sync::{mpsc as tmpsc, watch};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::client::{self, Client, Connection, Role, Settings};
-use crate::protocol::{Endpoint, ErrorCode, Fields, Hello, Message, Tally, TypeDescriptor};
+use crate::client::{self, Client, Connection, Role, Settings, Stop};
+use crate::protocol::{Endpoint, ErrorCode, ErrorMessage, Fields, Hello, Message, Tally, TypeDescriptor};
 use crate::runtime::runtime;
 use crate::store::{Store, text_shortcuts};
 use crate::wire::{self, Ended, lock};
@@ -48,7 +48,8 @@ impl PublisherConfig {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub enum PublisherEvent {
-    /// The handshake with the relay finished. The current text has been sent again.
+    /// The handshake with the relay finished and the current text has been sent again. The relay
+    /// checks the pairing code after this, so an [`PublisherEvent::Error`] may still follow.
     Connected {
         /// The relay's identity.
         relay: Endpoint,
@@ -57,7 +58,8 @@ pub enum PublisherEvent {
     },
     /// The combined tally of the receivers showing the published source changed (clause 14.3).
     Tally(Tally),
-    /// The relay reported an error.
+    /// The relay reported an error. After `not_allowed` the publisher does not reconnect: the
+    /// relay refused it (clause 14.5).
     Error {
         /// What went wrong.
         code: ErrorCode,
@@ -72,19 +74,29 @@ pub enum PublisherEvent {
     },
 }
 
+/// How long dropping a [`Publisher`] waits to deliver text the relay has not received yet.
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// An NTX publisher: sends text through a relay, which serves it to the network as a source
 /// (clause 14). Use it where a [`Source`](crate::Source) cannot accept connections.
+///
+/// Dropping a publisher first delivers text the relay has not received yet, waiting up to 3
+/// seconds, so a short-lived program does not lose its last update.
 pub struct Publisher {
     state: Arc<Mutex<State>>,
     events: Mutex<mpsc::Receiver<PublisherEvent>>,
-    stop: watch::Sender<bool>,
+    stop: watch::Sender<Stop>,
+    /// Disconnects when the background task ends.
+    done: Mutex<mpsc::Receiver<()>>,
     url: String,
 }
 
 struct State {
     store: Store,
-    /// The current connection's queue, once the relay accepted the `publish`.
+    /// The current connection's queue, once the handshake finished.
     out: Option<tmpsc::UnboundedSender<WsMessage>>,
+    /// Some text has not reached the relay yet.
+    unsent: bool,
 }
 
 impl Publisher {
@@ -99,6 +111,7 @@ impl Publisher {
         let state = Arc::new(Mutex::new(State {
             store: Store::new(config.channels.clone())?,
             out: None,
+            unsent: false,
         }));
         let settings = Settings::new(
             Role::Publisher,
@@ -110,17 +123,23 @@ impl Publisher {
             config.reconnect,
         );
         let (events_tx, events_rx) = mpsc::channel();
-        let (stop, stop_rx) = watch::channel(false);
+        let (stop, stop_rx) = watch::channel(Stop::Run);
+        let (done_tx, done) = mpsc::channel();
         let link = Link {
             settings,
             state: state.clone(),
             events: events_tx,
+            not_allowed: false,
         };
-        runtime().spawn(client::keep_connected(link, stop_rx));
+        runtime().spawn(async move {
+            client::keep_connected(link, stop_rx).await;
+            drop(done_tx);
+        });
         Ok(Publisher {
             state,
             events: Mutex::new(events_rx),
             stop,
+            done: Mutex::new(done),
             url,
         })
     }
@@ -172,14 +191,24 @@ impl Publisher {
 
 impl Drop for Publisher {
     fn drop(&mut self) {
-        let _ = self.stop.send(true);
+        let flush = {
+            let state = lock(&self.state);
+            state.unsent || state.out.is_some()
+        };
+        if flush {
+            let _ = self.stop.send(Stop::Flush);
+            let _ = lock(&self.done).recv_timeout(FLUSH_TIMEOUT);
+        }
+        let _ = self.stop.send(Stop::Now);
     }
 }
 
 impl State {
-    fn send(&self, frame: WsMessage) {
-        if let Some(out) = &self.out {
-            let _ = out.send(frame); // a closed connection is cleaned up by its own task
+    fn send(&mut self, frame: WsMessage) {
+        match &self.out {
+            // A closed connection is cleaned up by its own task.
+            Some(out) => drop(out.send(frame)),
+            None => self.unsent = true,
         }
     }
 }
@@ -189,6 +218,18 @@ struct Link {
     settings: Settings,
     state: Arc<Mutex<State>>,
     events: mpsc::Sender<PublisherEvent>,
+    /// The relay refused this publisher (clause 14.5); do not reconnect.
+    not_allowed: bool,
+}
+
+impl Link {
+    fn error(&mut self, error: ErrorMessage) {
+        self.not_allowed |= error.code == ErrorCode::NotAllowed;
+        let _ = self.events.send(PublisherEvent::Error {
+            code: error.code,
+            message: error.message,
+        });
+    }
 }
 
 impl Client for Link {
@@ -196,7 +237,12 @@ impl Client for Link {
         &self.settings
     }
 
-    async fn connected(&mut self, mut peer: Connection, hello: Hello) -> Ended {
+    async fn connected(
+        &mut self,
+        mut peer: Connection,
+        hello: Hello,
+        mut stop: watch::Receiver<Stop>,
+    ) -> Ended {
         // The relay starts a new session for every connection (clause 14.4), so send the whole
         // state again, as a source does on connect (clause 9.2). Under one lock, so no update is
         // lost or sent twice.
@@ -207,29 +253,37 @@ impl Client for Link {
                 let _ = out.send(frame);
             }
             state.out = Some(out);
+            state.unsent = false;
         }
         let _ = self.events.send(PublisherEvent::Connected {
             relay: hello.source,
             session: hello.session,
         });
-        let events = &self.events;
-        let ended = wire::pump(&mut peer, &mut out_rx, std::future::pending(), |message| {
-            let event = match message {
-                Message::Tally(tally) => PublisherEvent::Tally(tally),
-                Message::Error(e) => PublisherEvent::Error {
-                    code: e.code,
-                    message: e.message,
-                },
-                _ => return,
-            };
-            let _ = events.send(event);
+        let stopping = async move {
+            let _ = stop.wait_for(|s| *s != Stop::Run).await;
+            None
+        };
+        let ended = wire::pump(&mut peer, &mut out_rx, stopping, |message| match message {
+            Message::Tally(tally) => drop(self.events.send(PublisherEvent::Tally(tally))),
+            Message::Error(e) => self.error(e),
+            _ => {}
         })
         .await;
-        lock(&self.state).out = None;
+        {
+            let mut state = lock(&self.state);
+            state.out = None;
+            state.unsent |= !out_rx.is_empty();
+        }
+        // Let the relay read everything before the socket goes away.
+        peer.finish().await;
         ended
     }
 
+    fn refused(&mut self, error: ErrorMessage) {
+        self.error(error);
+    }
+
     fn disconnected(&mut self, reason: String) -> bool {
-        self.events.send(PublisherEvent::Disconnected { reason }).is_ok()
+        self.events.send(PublisherEvent::Disconnected { reason }).is_ok() && !self.not_allowed
     }
 }

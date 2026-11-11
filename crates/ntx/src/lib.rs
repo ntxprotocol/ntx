@@ -11,6 +11,7 @@
 //!
 //! The networking objects run on a background runtime. Events are queued and read with
 //! `poll_event` or `wait_event`, so the API works the same from Rust, C and other languages.
+//! The queues are not bounded: read the events regularly, or drop the object when done.
 //!
 //! ```no_run
 //! let source = ntx::Source::start(ntx::SourceConfig::new("Song Board")).unwrap();

@@ -374,6 +374,12 @@ fn publisher_and_relay_errors() {
         with_string(ntx_relay_allow_origin, ptr::null(), "x"),
         NTX_ERR_ARGUMENT
     );
+    let relay = relay_start(&json!({"name": "errors", "port": 0, "advertise": false}));
+    assert_eq!(with_string(ntx_relay_allow_origin, relay, "null"), NTX_ERR_FAILED);
+    assert!(last_error().contains("invalid origin"));
+    assert_eq!(with_string(ntx_relay_revoke_origin, relay, "x"), NTX_ERR_FAILED);
+    // SAFETY: a handle from this library, freed once.
+    unsafe { ntx_relay_free(relay) };
     assert_eq!(event(ntx_relay_wait_event, ptr::null(), 0), None);
     // SAFETY: a null config is allowed and reported.
     let code = unsafe { ntx_relay_start(ptr::null(), ptr::null_mut()) };

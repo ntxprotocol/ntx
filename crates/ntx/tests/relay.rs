@@ -5,9 +5,10 @@ mod common;
 use std::time::Duration;
 
 use common::{WAIT, next_update, publisher, publisher_config, receiver_at, relay, text, wait_for};
+use ntx::protocol::ErrorCode;
 use ntx::{
-    Error, Fields, Publisher, PublisherConfig, PublisherEvent, Receiver, ReceiverEvent, Relay, RelayConfig,
-    RelayEvent, Tally, TypeDescriptor, display_name,
+    Browser, BrowserEvent, Error, Fields, Publisher, PublisherConfig, PublisherEvent, Receiver,
+    ReceiverEvent, Relay, RelayConfig, RelayEvent, Tally, TypeDescriptor, display_name,
 };
 use serde_json::json;
 
@@ -145,10 +146,81 @@ fn receivers_find_the_source_again_after_the_publisher_reconnects() {
     );
     assert_eq!((update.seq, text(&update)), (1, "two"));
 
-    // Another publisher with the same id at the same time gets another port.
-    let _third = publisher(&relay, "pub-again", None);
-    let (other, _) = served(&relay);
-    assert_ne!(other, port);
+    // A newer connection for the same id wins (clause 14.4): the older publisher is told
+    // `not_allowed` and does not come back; the newer one is served on the same port.
+    let third = publisher(&relay, "pub-again", None);
+    third.update_text("program", "three").unwrap();
+    let error = wait_for(
+        || second.wait_event(WAIT),
+        |e| match e {
+            PublisherEvent::Error { code, .. } => Some(code),
+            _ => None,
+        },
+    );
+    assert_eq!(error, ErrorCode::NotAllowed);
+    assert!(matches!(
+        second.wait_event(WAIT),
+        Some(PublisherEvent::Disconnected { .. })
+    ));
+    let (newest, _) = served(&relay);
+    assert_eq!(newest, port);
+    assert_eq!(
+        second.wait_event(Duration::from_millis(2500)),
+        None,
+        "reconnected"
+    );
+}
+
+#[test]
+fn dropping_a_publisher_delivers_its_last_update() {
+    let relay = relay(None, &[]);
+    let p = publisher(&relay, "pub-last", None);
+    let (port, _) = served(&relay);
+    let r = receiver_at(port, &["program"]);
+    next_update(&r);
+    p.update_text("program", "last words").unwrap();
+    drop(p);
+    assert_eq!(text(&next_update(&r)), "last words");
+}
+
+#[test]
+fn a_published_source_stops_advertising_when_its_publisher_leaves() {
+    let mut config = RelayConfig::new("TEST (relay)");
+    config.port = 0;
+    let relay = Relay::start(config).unwrap();
+    let browser = Browser::start().unwrap();
+    let p = publisher(&relay, "pub-mdns-leaves", None);
+    let is_ours = |id: &str| id == "pub-mdns-leaves";
+    wait_for(
+        || browser.wait_event(Duration::from_secs(10)),
+        |e| matches!(e, BrowserEvent::Found(ref s) if is_ours(&s.id)).then_some(()),
+    );
+    drop(p);
+    wait_for(
+        || browser.wait_event(Duration::from_secs(10)),
+        |e| matches!(e, BrowserEvent::Lost { ref id, .. } if is_ours(id)).then_some(()),
+    );
+}
+
+#[test]
+fn programs_are_limited_per_origin() {
+    let relay = relay(None, &[]);
+    let publishers: Vec<_> = (0..8)
+        .map(|i| publisher(&relay, &format!("pub-limit-{i}"), None))
+        .collect();
+    for _ in &publishers {
+        served(&relay);
+    }
+    let one_too_many = publisher(&relay, "pub-limit-8", None);
+    let error = wait_for(
+        || one_too_many.wait_event(WAIT),
+        |e| match e {
+            PublisherEvent::Error { code, message } => Some((code, message)),
+            _ => None,
+        },
+    );
+    assert_eq!(error.0, ErrorCode::NotAllowed);
+    assert!(error.1.unwrap().contains("too many"));
 }
 
 #[test]
@@ -235,7 +307,13 @@ fn invalid_use_is_refused() {
     assert_ne!(disconnect_reason(&p), "");
     assert_eq!(p.poll_event(), None);
 
+    let mut config = RelayConfig::new("TEST");
+    config.allowed_origins = vec!["example.com".into()];
+    assert!(matches!(Relay::start(config), Err(Error::InvalidOrigin(_))));
+
     let taken = relay(None, &[]);
+    assert!(matches!(taken.allow_origin("null"), Err(Error::InvalidOrigin(_))));
+    assert!(matches!(taken.revoke_origin("x"), Err(Error::InvalidOrigin(_))));
     let mut config = RelayConfig::new("TEST");
     config.port = taken.local_addr().port();
     assert!(matches!(Relay::start(config), Err(Error::Io(_))));

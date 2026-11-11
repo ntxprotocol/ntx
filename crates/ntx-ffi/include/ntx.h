@@ -19,6 +19,7 @@
  * - Handles come from ntx_*_start / ntx_*_connect and are freed with ntx_*_free.
  *   They may be used from any thread.
  * - Events are polled with ntx_*_wait_event(); the library never calls back into your code.
+ *   Events queue up until read: poll regularly, or free the handle when done.
  */
 
 // Success.
@@ -267,14 +268,16 @@ void ntx_publisher_free(struct NtxPublisher *publisher);
 int ntx_relay_start(const char *config_json, struct NtxRelay **out);
 
 // Allows web pages from `origin` (e.g. `"https://example.com"`) to publish. Call it when the
-// user agrees to an `origin_requested` event.
+// user agrees to an `origin_requested` event. Fails for an origin that is not
+// `scheme://host[:port]`.
 //
 // # Safety
 //
 // Pointers must be null or valid: NUL-terminated UTF-8 strings, live handles (see `ntx.h`).
 int ntx_relay_allow_origin(const struct NtxRelay *relay, const char *origin);
 
-// Withdraws permission from `origin` and disconnects its publishers.
+// Withdraws permission from `origin`; its publishers receive `not_allowed` and are
+// disconnected. Fails for an origin that is not `scheme://host[:port]`.
 //
 // # Safety
 //

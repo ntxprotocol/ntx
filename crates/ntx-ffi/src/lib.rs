@@ -809,7 +809,8 @@ pub unsafe extern "C" fn ntx_relay_start(config_json: *const c_char, out: *mut *
 }
 
 /// Allows web pages from `origin` (e.g. `"https://example.com"`) to publish. Call it when the
-/// user agrees to an `origin_requested` event.
+/// user agrees to an `origin_requested` event. Fails for an origin that is not
+/// `scheme://host[:port]`.
 ///
 /// # Safety
 ///
@@ -820,12 +821,13 @@ pub unsafe extern "C" fn ntx_relay_allow_origin(relay: *const NtxRelay, origin: 
         // SAFETY: pointer rules are the caller's, as documented.
         let relay = unsafe { handle_arg(relay) }?;
         // SAFETY: as above.
-        relay.0.allow_origin(unsafe { str_arg(origin, "origin") }?);
+        relay.0.allow_origin(unsafe { str_arg(origin, "origin") }?)?;
         Ok(())
     })
 }
 
-/// Withdraws permission from `origin` and disconnects its publishers.
+/// Withdraws permission from `origin`; its publishers receive `not_allowed` and are
+/// disconnected. Fails for an origin that is not `scheme://host[:port]`.
 ///
 /// # Safety
 ///
@@ -836,7 +838,7 @@ pub unsafe extern "C" fn ntx_relay_revoke_origin(relay: *const NtxRelay, origin:
         // SAFETY: pointer rules are the caller's, as documented.
         let relay = unsafe { handle_arg(relay) }?;
         // SAFETY: as above.
-        relay.0.revoke_origin(unsafe { str_arg(origin, "origin") }?);
+        relay.0.revoke_origin(unsafe { str_arg(origin, "origin") }?)?;
         Ok(())
     })
 }

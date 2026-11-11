@@ -12,7 +12,6 @@ use ntx::{
     Browser, BrowserEvent, Fields, Publisher, PublisherConfig, PublisherEvent, Receiver, ReceiverConfig,
     ReceiverEvent, Relay, RelayConfig, RelayEvent, Source, SourceConfig, SourceEvent, Tally, display_name,
 };
-use serde_json::Value;
 
 type CliResult = Result<(), Box<dyn Error>>;
 
@@ -46,7 +45,7 @@ enum Command {
     /// Run a relay: serve publishers to the network as sources.
     ///
     /// Web pages may publish only from origins allowed with --allow-origin; programs that send
-    /// no Origin header are always allowed. The relay stops at the end of standard input.
+    /// no Origin header only from this computer. The relay stops at the end of standard input.
     Relay(RelayArgs),
 }
 
@@ -215,7 +214,7 @@ fn send(args: &SendArgs) -> CliResult {
     reporting(
         |t| source.wait_event(t),
         describe,
-        || send_lines(&args.lines, |c, t, f| source.update(c, t, f)),
+        || send_lines(&args.lines, &source),
     )
 }
 
@@ -239,7 +238,7 @@ fn publish(args: &PublishArgs) -> CliResult {
     reporting(
         |t| publisher.wait_event(t),
         describe,
-        || send_lines(&args.lines, |c, t, f| publisher.update(c, t, f)),
+        || send_lines(&args.lines, &publisher),
     )
 }
 
@@ -306,18 +305,42 @@ fn reporting<E>(
     })
 }
 
-/// Sends each line of standard input with `update(channel, type, fields)`.
-fn send_lines(args: &LineArgs, update: impl Fn(&str, &str, Fields) -> ntx::Result<u64>) -> CliResult {
+/// What `send` and `publish` send lines with: a source or a publisher.
+trait Lines {
+    fn update(&self, channel: &str, type_name: &str, fields: Fields) -> ntx::Result<u64>;
+    fn update_text(&self, channel: &str, text: &str) -> ntx::Result<u64>;
+    fn clear(&self, channel: &str) -> ntx::Result<u64>;
+}
+
+macro_rules! lines {
+    ($($sender:ty),*) => {$(
+        impl Lines for $sender {
+            fn update(&self, channel: &str, type_name: &str, fields: Fields) -> ntx::Result<u64> {
+                <$sender>::update(self, channel, type_name, fields)
+            }
+            fn update_text(&self, channel: &str, text: &str) -> ntx::Result<u64> {
+                <$sender>::update_text(self, channel, text)
+            }
+            fn clear(&self, channel: &str) -> ntx::Result<u64> {
+                <$sender>::clear(self, channel)
+            }
+        }
+    )*};
+}
+
+lines!(Source, Publisher);
+
+/// Sends each line of standard input with `sender`.
+fn send_lines(args: &LineArgs, sender: &impl Lines) -> CliResult {
     eprintln!("type a line and press Enter to send it; an empty line clears; Ctrl-D quits");
     for line in std::io::stdin().lock().lines() {
         let line = line?;
         let seq = if line.is_empty() {
-            update(&args.channel, "ntx.text", Fields::new())?
+            sender.clear(&args.channel)?
         } else if args.json {
-            update(&args.channel, &args.type_name, serde_json::from_str(&line)?)?
+            sender.update(&args.channel, &args.type_name, serde_json::from_str(&line)?)?
         } else {
-            let fields = Fields::from_iter([("text".to_string(), Value::String(line))]);
-            update(&args.channel, "ntx.text", fields)?
+            sender.update_text(&args.channel, &line)?
         };
         eprintln!("sent seq {seq}");
     }

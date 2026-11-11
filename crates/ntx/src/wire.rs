@@ -34,6 +34,12 @@ const DEAD_AFTER: Duration = Duration::from_secs(15);
 /// How long the first message of a handshake may take (clause 8.6).
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Longest `message` in `error`, in bytes; the limit is 1024 characters (clause 12).
+const MAX_ERROR_MESSAGE: usize = 1024;
+
+/// Longest close reason: a close frame's payload is at most 125 bytes, two of them the code.
+const MAX_CLOSE_REASON: usize = 123;
+
 /// How long to wait for the peer to answer a close.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -179,12 +185,16 @@ pub(crate) fn frame(message: &Message) -> crate::Result<WsMessage> {
     Ok(WsMessage::text(json))
 }
 
+/// Why a connection is being stopped: `None` to close normally, or an error to send first.
+pub(crate) type Refusal = Option<(ErrorCode, String)>;
+
 /// Runs a connection after its handshake until it ends: sends queued frames, passes received
-/// messages to `handle`, keeps the heartbeat (clause 11) and closes when `stop` completes.
+/// messages to `handle`, and keeps the heartbeat (clause 11). When `stop` completes, it sends
+/// the frames still queued, then closes (with the error `stop` gives, if any).
 pub(crate) async fn pump<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     peer: &mut Peer<S>,
     out: &mut mpsc::UnboundedReceiver<WsMessage>,
-    stop: impl Future<Output = ()>,
+    stop: impl Future<Output = Refusal>,
     mut handle: impl FnMut(Message),
 ) -> Ended {
     tokio::pin!(stop);
@@ -197,9 +207,18 @@ pub(crate) async fn pump<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             },
             message = peer.recv() => message.map(&mut handle),
             _ = tick.tick() => peer.heartbeat().await,
-            () = &mut stop => {
-                peer.close().await;
-                Err(Ended("stopped".into()))
+            refusal = &mut stop => {
+                while let Ok(frame) = out.try_recv() {
+                    if peer.send_frame(frame).await.is_err() {
+                        break;
+                    }
+                }
+                if let Some((code, reason)) = refusal {
+                    Err(peer.reject(code, reason).await)
+                } else {
+                    peer.close(None).await;
+                    Err(Ended("stopped".into()))
+                }
             }
         };
         if let Err(ended) = outcome {
@@ -257,26 +276,30 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Peer<S> {
     pub(crate) async fn reject(&mut self, code: ErrorCode, reason: String) -> Ended {
         let error = Message::Error(ErrorMessage {
             code: code.clone(),
-            message: Some(reason.clone()),
+            message: Some(cut(&reason, MAX_ERROR_MESSAGE).to_string()),
         });
-        let close = WsMessage::Close(Some(CloseFrame {
-            code: CloseCode::from(code.close_code()),
-            reason: reason.as_str().into(),
-        }));
         // The connection ends either way, so failures to send are not interesting.
         let _ = self.send(&error).await;
-        self.close_with(close).await;
+        self.close(Some((code.close_code(), &reason))).await;
         Ended(reason)
     }
 
-    /// Closes the connection without an error.
-    pub(crate) async fn close(&mut self) {
-        self.close_with(WsMessage::Close(None)).await;
+    /// Closes the connection, with a WebSocket close code and reason if given. The reason is cut
+    /// to fit a close frame (RFC 6455, section 5.5). When the peer is dropped, or [`Peer::finish`]
+    /// is called, it waits for the other side to close too.
+    pub(crate) async fn close(&mut self, code: Option<(u16, &str)>) {
+        let frame = code.map(|(code, reason)| CloseFrame {
+            code: CloseCode::from(code),
+            reason: cut(reason, MAX_CLOSE_REASON).into(),
+        });
+        self.closing = self.send_frame(WsMessage::Close(frame)).await.is_ok();
     }
 
-    /// Sends `close`. When the peer is dropped, it waits for the peer to close too.
-    async fn close_with(&mut self, close: WsMessage) {
-        self.closing = self.send_frame(close).await.is_ok();
+    /// Drops the connection, first waiting (briefly) for the other side to answer a close.
+    pub(crate) async fn finish(mut self) {
+        if let Some(stream) = self.stream.take().filter(|_| self.closing) {
+            drain(stream).await;
+        }
     }
 
     /// Returns the next NTX message. Pings are answered and unknown ops skipped (clause 7.2).
@@ -346,20 +369,31 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Drop for Peer<S> {
     /// the connection on some systems (Windows), and the peer would lose its last messages, such
     /// as an `error`. This runs on its own task, so nothing can cancel it halfway.
     fn drop(&mut self) {
-        let Some(mut stream) = self.stream.take().filter(|_| self.closing) else {
-            return;
-        };
-        runtime().spawn(async move {
-            let drain = async {
-                while let Some(Ok(frame)) = stream.next().await {
-                    if frame.is_close() {
-                        break;
-                    }
-                }
-            };
-            let _ = tokio::time::timeout(CLOSE_TIMEOUT, drain).await;
-        });
+        if let Some(stream) = self.stream.take().filter(|_| self.closing) {
+            runtime().spawn(drain(stream));
+        }
     }
+}
+
+/// Reads until the other side closes, for up to [`CLOSE_TIMEOUT`].
+async fn drain<S: AsyncRead + AsyncWrite + Unpin>(mut stream: SplitStream<WebSocketStream<S>>) {
+    let closed = async {
+        while let Some(Ok(frame)) = stream.next().await {
+            if frame.is_close() {
+                break;
+            }
+        }
+    };
+    let _ = tokio::time::timeout(CLOSE_TIMEOUT, closed).await;
+}
+
+/// Cuts `text` to at most `max` bytes without splitting a character.
+pub(crate) fn cut(text: &str, max: usize) -> &str {
+    let end = (0..=max.min(text.len()))
+        .rev()
+        .find(|&i| text.is_char_boundary(i))
+        .unwrap_or(0);
+    &text[..end]
 }
 
 /// The `bad_message` error for `e`.

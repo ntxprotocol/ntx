@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
-use crate::client::{self, Client, Connection, Role, Settings};
-use crate::protocol::{Endpoint, ErrorCode, Hello, Message, Tally, TypeDescriptor, Update};
+use crate::client::{self, Client, Connection, Role, Settings, Stop};
+use crate::protocol::{Endpoint, ErrorCode, ErrorMessage, Hello, Message, Tally, TypeDescriptor, Update};
 use crate::runtime::runtime;
 use crate::wire::{self, Ended, HEARTBEAT_INTERVAL, lock};
 use crate::{PROGRAM, Result};
@@ -76,7 +76,7 @@ pub enum ReceiverEvent {
 pub struct Receiver {
     events: Mutex<mpsc::Receiver<ReceiverEvent>>,
     tally: watch::Sender<Option<Tally>>,
-    stop: watch::Sender<bool>,
+    stop: watch::Sender<Stop>,
     url: String,
 }
 
@@ -91,7 +91,7 @@ impl Receiver {
         let url = client::normalize_url(address, "/")?;
         let (events_tx, events_rx) = mpsc::channel();
         let (tally, tally_rx) = watch::channel(None);
-        let (stop, stop_rx) = watch::channel(false);
+        let (stop, stop_rx) = watch::channel(Stop::Run);
         let settings = Settings::new(
             Role::Receiver,
             url.clone(),
@@ -140,7 +140,7 @@ impl Receiver {
 
 impl Drop for Receiver {
     fn drop(&mut self) {
-        let _ = self.stop.send(true);
+        let _ = self.stop.send(Stop::Now);
     }
 }
 
@@ -185,7 +185,7 @@ impl Client for Link {
         &self.settings
     }
 
-    async fn connected(&mut self, mut peer: Connection, hello: Hello) -> Ended {
+    async fn connected(&mut self, mut peer: Connection, hello: Hello, _: watch::Receiver<Stop>) -> Ended {
         self.seen.start_session(&hello.session);
         let _ = self.events.send(ReceiverEvent::Connected {
             source: hello.source,
@@ -193,6 +193,13 @@ impl Client for Link {
             channels: hello.channels,
         });
         self.receive(&mut peer).await
+    }
+
+    fn refused(&mut self, error: ErrorMessage) {
+        let _ = self.events.send(ReceiverEvent::Error {
+            code: error.code,
+            message: error.message,
+        });
     }
 
     fn disconnected(&mut self, reason: String) -> bool {

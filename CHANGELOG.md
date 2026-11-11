@@ -20,6 +20,11 @@ All notable changes are listed here. The format follows
 - Publishing through a relay (spec clause 14): `Publisher` sends text through a relay, with
   pairing, tally events and reconnection; `Relay` serves each publisher to the network as a
   source, checks web page origins against an allow-list (`origin_requested` events,
-  `allow_origin`, `revoke_origin`) and keeps each published source on the same port when its
-  publisher reconnects. Also in the C ABI (`ntx_publisher_*`, `ntx_relay_*`) and the CLI
-  (`ntx publish`, `ntx relay`).
+  `allow_origin`, `revoke_origin`; `null` always refused), accepts programs without an `Origin`
+  header from loopback only, limits publishers (32, and 8 per origin), lets the newest connection
+  for a source id win, and keeps each published source on the same port when its publisher
+  reconnects. Dropping a publisher first delivers unsent text (up to 3 seconds). Also in the C ABI
+  (`ntx_publisher_*`, `ntx_relay_*`) and the CLI (`ntx publish`, `ntx relay`).
+- Closing a connection waits briefly for the other side's close, so a final `error` is not lost
+  (Windows resets connections closed with unread data). Close reasons are cut to fit a close
+  frame.

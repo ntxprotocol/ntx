@@ -279,3 +279,58 @@ fn relay_refuses_web_pages_unless_allowed() {
     assert!(connect("https://ok.example").contains("\"hello\""));
     assert!(relay.finish().success());
 }
+
+#[test]
+#[allow(clippy::result_large_err)] // the callback's error type comes from tungstenite
+fn piped_input_reaches_the_relay_before_publish_exits() {
+    // A fake relay that records what the publisher sends.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("ws://{}/publish", listener.local_addr().unwrap());
+    let relay = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let echo_ntx = |_: &tungstenite::handshake::server::Request,
+                        mut response: tungstenite::handshake::server::Response| {
+            let headers = response.headers_mut();
+            headers.insert("sec-websocket-protocol", "ntx".parse().unwrap());
+            Ok(response)
+        };
+        let mut ws = tungstenite::accept_hdr(stream, echo_ntx).unwrap();
+        let hello = r#"{"op":"hello","ntx":"0.1","source":{"id":"fake","name":"FAKE"},"channels":["program"],"session":"s"}"#;
+        ws.send(tungstenite::Message::text(hello)).unwrap();
+        let mut seen = Vec::new();
+        while let Ok(message) = ws.read() {
+            if let tungstenite::Message::Text(text) = message {
+                seen.push(text.to_string());
+            }
+        }
+        seen
+    });
+    let mut command = Command::new(NTX)
+        .args(["publish", &url])
+        .stdin(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    writeln!(command.stdin.take().unwrap(), "hi").unwrap();
+    assert!(command.wait().unwrap().success());
+    let seen = relay.join().unwrap();
+    assert!(seen.iter().any(|m| m.contains(r#""text":"hi""#)), "{seen:?}");
+}
+
+#[test]
+fn relay_refuses_an_invalid_allowed_origin() {
+    let output = Command::new(NTX)
+        .args([
+            "relay",
+            "--port",
+            "0",
+            "--no-mdns",
+            "--allow-origin",
+            "example.com",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid origin"));
+}
