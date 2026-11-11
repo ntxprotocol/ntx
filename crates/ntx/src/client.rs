@@ -159,7 +159,7 @@ async fn connect(
         .as_ref()
         .zip(pairing_code)
         .map(|(challenge, code)| PairingProof {
-            proof: pairing::proof(code, &challenge.nonce),
+            proof: Some(pairing::proof(code, &challenge.nonce)),
         });
     Ok((peer, hello, proof))
 }

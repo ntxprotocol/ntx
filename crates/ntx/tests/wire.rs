@@ -80,14 +80,38 @@ fn handshake_errors_close_with_the_right_codes() {
 }
 
 #[test]
-fn pairing_required_without_proof() {
+fn pairing_proofs_missing_or_malformed() {
+    // Clause 13.4: no `pairing` or no `proof` is pairing_required; a proof that is not
+    // 44 characters of Base64 is pairing_failed, not bad_message.
     let s = source(Some("4321"));
+    let cases = [
+        (None, "pairing_required"),
+        (Some(json!({})), "pairing_required"),
+        (Some(json!({"proof": "not-base64"})), "pairing_failed"),
+    ];
+    for (pairing, code) in cases {
+        let mut ws = raw_connect(&format!("ws://{}/", s.local_addr()));
+        let hello = read_json(&mut ws);
+        assert_eq!(hello["pairing"]["nonce"].as_str().map(str::len), Some(32));
+        let mut answer = subscribe("0.1");
+        if let Some(pairing) = pairing {
+            answer["pairing"] = pairing;
+        }
+        send_json(&mut ws, &answer);
+        assert_eq!(read_json(&mut ws)["code"], code);
+        assert_eq!(read_close(&mut ws), 4003);
+    }
+}
+
+#[test]
+fn pairing_is_ignored_when_not_required() {
+    let s = source(None);
     let mut ws = raw_connect(&format!("ws://{}/", s.local_addr()));
-    let hello = read_json(&mut ws);
-    assert_eq!(hello["pairing"]["nonce"].as_str().map(str::len), Some(32));
-    send_json(&mut ws, &subscribe("0.1"));
-    assert_eq!(read_json(&mut ws)["code"], "pairing_required");
-    assert_eq!(read_close(&mut ws), 4003);
+    read_json(&mut ws);
+    let mut answer = subscribe("0.1");
+    answer["pairing"] = json!({"proof": "not-base64"});
+    send_json(&mut ws, &answer);
+    assert_eq!(read_json(&mut ws)["op"], "update");
 }
 
 #[test]

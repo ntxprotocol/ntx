@@ -392,7 +392,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Peer<S> {
     /// Sends `error` and closes the connection with the matching close code (clause 12).
     pub(crate) async fn reject(&mut self, code: ErrorCode, reason: String) -> Ended {
         let error = Message::Error(ErrorMessage {
-            code: code.clone(),
+            code,
             message: Some(cut(&reason, MAX_ERROR_MESSAGE).to_string()),
         });
         // The connection ends either way, so failures to send are not interesting.
@@ -574,11 +574,11 @@ async fn check_answer(
 ) -> Result<(), (ErrorCode, String)> {
     check_version(ntx)?;
     if let Some((code, nonce)) = pairing {
-        let Some(proof) = proof else {
+        let Some(proof) = proof.and_then(|p| p.proof.as_deref()) else {
             return Err((ErrorCode::PairingRequired, "a pairing code is needed".into()));
         };
         let locked_out = slot.locked_out();
-        if locked_out || !pairing::verify(code, nonce, &proof.proof) {
+        if locked_out || !pairing::verify(code, nonce, proof) {
             slot.pairing_failed();
             tokio::time::sleep(Duration::from_secs(1)).await;
             let reason = if locked_out {
