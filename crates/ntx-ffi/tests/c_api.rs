@@ -10,6 +10,8 @@ use std::ptr;
 use ntx_ffi::*;
 use serde_json::{Value, json};
 
+const LYRICS: &str = r#"[{"ntxType": "com.example.lyrics", "schema": {"type": "object"}}]"#;
+
 fn c(s: &str) -> CString {
     CString::new(s).unwrap()
 }
@@ -52,13 +54,20 @@ fn start(config: &Value) -> *mut NtxSource {
     source_start(&c(&config.to_string())).unwrap_or_else(|code| panic!("{code}: {}", last_error()))
 }
 
-fn update(source: *const NtxSource, type_name: &str, fields: &str) -> Result<u64, c_int> {
+// Sources and publishers share these functions; the C function is passed in.
+type UpdateFn<T> =
+    unsafe extern "C" fn(*const T, *const c_char, *const c_char, *const c_char, *mut u64) -> c_int;
+type TextFn<T> = unsafe extern "C" fn(*const T, *const c_char, *const c_char) -> c_int;
+type StringFn<T> = unsafe extern "C" fn(*const T, *const c_char) -> c_int;
+type EventFn<T> = unsafe extern "C" fn(*const T, u32) -> *mut c_char;
+
+fn update<T>(f: UpdateFn<T>, handle: *const T, type_name: &str, fields: &str) -> Result<u64, c_int> {
     let (channel, type_name, fields) = (c("program"), c(type_name), c(fields));
     let mut seq = 0;
     // SAFETY: valid strings, a live or null handle, and a writable `seq`.
     let code = unsafe {
-        ntx_source_update(
-            source,
+        f(
+            handle,
             channel.as_ptr(),
             type_name.as_ptr(),
             fields.as_ptr(),
@@ -68,27 +77,22 @@ fn update(source: *const NtxSource, type_name: &str, fields: &str) -> Result<u64
     if code == NTX_OK { Ok(seq) } else { Err(code) }
 }
 
-fn update_text(source: *const NtxSource, text: &str) -> c_int {
+fn update_text<T>(f: TextFn<T>, handle: *const T, text: &str) -> c_int {
     let (channel, text) = (c("program"), c(text));
     // SAFETY: valid strings and a live or null handle.
-    unsafe { ntx_source_update_text(source, channel.as_ptr(), text.as_ptr()) }
+    unsafe { f(handle, channel.as_ptr(), text.as_ptr()) }
 }
 
-fn clear(source: *const NtxSource) -> c_int {
-    let channel = c("program");
+/// Calls a function that takes a handle and one string: clear, announce, allow or revoke.
+fn with_string<T>(f: StringFn<T>, handle: *const T, text: &str) -> c_int {
+    let text = c(text);
     // SAFETY: a valid string and a live or null handle.
-    unsafe { ntx_source_clear(source, channel.as_ptr()) }
+    unsafe { f(handle, text.as_ptr()) }
 }
 
-fn announce(source: *const NtxSource, types: &str) -> c_int {
-    let types = c(types);
-    // SAFETY: a valid string and a live or null handle.
-    unsafe { ntx_source_announce(source, types.as_ptr()) }
-}
-
-fn source_event(source: *const NtxSource, timeout_ms: u32) -> Option<Value> {
+fn event<T>(f: EventFn<T>, handle: *const T, timeout_ms: u32) -> Option<Value> {
     // SAFETY: a live or null handle.
-    take_json(unsafe { ntx_source_wait_event(source, timeout_ms) })
+    take_json(unsafe { f(handle, timeout_ms) })
 }
 
 fn source_info(source: *const NtxSource) -> Value {
@@ -114,14 +118,26 @@ fn set_tally(receiver: *const NtxReceiver, program: bool) -> c_int {
     unsafe { ntx_receiver_set_tally(receiver, program, false) }
 }
 
-fn receiver_event(receiver: *const NtxReceiver, timeout_ms: u32) -> Option<Value> {
-    // SAFETY: a live handle.
-    take_json(unsafe { ntx_receiver_wait_event(receiver, timeout_ms) })
-}
-
 fn receiver_free(receiver: *mut NtxReceiver) {
     // SAFETY: a handle from this library (or null), freed once.
     unsafe { ntx_receiver_free(receiver) };
+}
+
+fn relay_start(config: &Value) -> *mut NtxRelay {
+    let config = c(&config.to_string());
+    let mut relay = ptr::null_mut();
+    // SAFETY: a valid string and out-pointer.
+    let code = unsafe { ntx_relay_start(config.as_ptr(), &raw mut relay) };
+    assert_eq!(code, NTX_OK, "{}", last_error());
+    relay
+}
+
+fn publisher_connect(address: &str, config: &str) -> Result<*mut NtxPublisher, c_int> {
+    let (address, config) = (c(address), c(config));
+    let mut publisher = ptr::null_mut();
+    // SAFETY: valid strings and out-pointer.
+    let code = unsafe { ntx_publisher_connect(address.as_ptr(), config.as_ptr(), &raw mut publisher) };
+    if code == NTX_OK { Ok(publisher) } else { Err(code) }
 }
 
 fn render(fields: &str, pattern: &str) -> Option<String> {
@@ -159,23 +175,23 @@ fn source_and_receiver_round_trip() {
     );
     let address = format!("ws://{}/", info["address"].as_str().unwrap());
 
-    assert_eq!(
-        announce(
-            source,
-            r#"[{"ntxType": "com.example.lyrics", "schema": {"type": "object"}}]"#
-        ),
-        NTX_OK
-    );
-    assert_eq!(update_text(source, "Welcome"), NTX_OK);
+    assert_eq!(with_string(ntx_source_announce, source, LYRICS), NTX_OK);
+    assert_eq!(update_text(ntx_source_update_text, source, "Welcome"), NTX_OK);
 
     let config = r#"{"name": "C API (receiver)", "id": "r", "channels": ["program"], "reconnect": true}"#;
     let receiver = connect(&address, config).unwrap();
-    let next = || receiver_event(receiver, 5000);
+    let next = || event(ntx_receiver_wait_event, receiver, 5000);
     assert_eq!(wait_for(next, "connected")["source"]["id"], "c-api");
     assert_eq!(wait_for(next, "announce")[0]["ntxType"], "com.example.lyrics");
     assert_eq!(wait_for(next, "update")["fields"]["text"], "Welcome");
 
-    let seq = update(source, "com.example.lyrics", r#"{"line": "Amazing grace"}"#).unwrap();
+    let seq = update(
+        ntx_source_update,
+        source,
+        "com.example.lyrics",
+        r#"{"line": "Amazing grace"}"#,
+    )
+    .unwrap();
     let update = wait_for(next, "update");
     assert_eq!(
         (update["seq"].as_u64(), update["fields"]["line"].as_str()),
@@ -184,13 +200,13 @@ fn source_and_receiver_round_trip() {
 
     assert_eq!(set_tally(receiver, true), NTX_OK);
     assert_eq!(
-        wait_for(|| source_event(source, 5000), "tally_changed"),
+        wait_for(|| event(ntx_source_wait_event, source, 5000), "tally_changed"),
         json!({"program": true, "preview": false})
     );
 
-    assert_eq!(clear(source), NTX_OK);
+    assert_eq!(with_string(ntx_source_clear, source, "program"), NTX_OK);
     assert_eq!(wait_for(next, "update")["fields"], json!({}));
-    assert_eq!(receiver_event(receiver, 0), None);
+    assert_eq!(event(ntx_receiver_wait_event, receiver, 0), None);
 
     receiver_free(receiver);
     source_free(source);
@@ -219,11 +235,17 @@ fn errors_are_reported() {
     assert!(last_error().contains("UTF-8"));
 
     let source = start(&json!({"name": "errors", "bind": "127.0.0.1", "port": 0, "advertise": false}));
-    assert_eq!(update(source, "Bad Name", "{}"), Err(NTX_ERR_FAILED));
+    assert_eq!(
+        update(ntx_source_update, source, "Bad Name", "{}"),
+        Err(NTX_ERR_FAILED)
+    );
     assert!(last_error().contains("invalid type name"));
-    assert_eq!(clear(ptr::null()), NTX_ERR_ARGUMENT);
-    assert_eq!(announce(source, "[1]"), NTX_ERR_ARGUMENT);
-    assert_eq!(source_event(ptr::null(), 0), None);
+    assert_eq!(
+        with_string(ntx_source_clear, ptr::null(), "program"),
+        NTX_ERR_ARGUMENT
+    );
+    assert_eq!(with_string(ntx_source_announce, source, "[1]"), NTX_ERR_ARGUMENT);
+    assert_eq!(event(ntx_source_wait_event, ptr::null(), 0), None);
 
     assert_eq!(connect("http://x", r#"{"name":"r"}"#), Err(NTX_ERR_FAILED));
     assert_eq!(set_tally(ptr::null(), true), NTX_ERR_ARGUMENT);
@@ -264,4 +286,100 @@ fn browser_finds_a_source() {
     // SAFETY: a handle from this library, freed once.
     unsafe { ntx_browser_free(browser) };
     source_free(source);
+}
+
+#[test]
+fn publisher_through_relay() {
+    let relay = relay_start(&json!({
+        "name": "C API (relay)", "id": "c-relay", "bind": "127.0.0.1", "port": 0, "path": "/publish",
+        "allowed_origins": ["https://a.example"], "advertise": false
+    }));
+    // SAFETY: a live handle.
+    let info = take_json(unsafe { ntx_relay_info(relay) }).unwrap();
+    let address = info["address"].as_str().unwrap();
+    assert_eq!(
+        with_string(ntx_relay_allow_origin, relay, "https://b.example"),
+        NTX_OK
+    );
+    assert_eq!(
+        with_string(ntx_relay_revoke_origin, relay, "https://a.example"),
+        NTX_OK
+    );
+
+    let config =
+        r#"{"name": "C API (publisher)", "id": "c-pub", "channels": ["program"], "reconnect": true}"#;
+    let publisher = publisher_connect(&format!("ws://{address}/publish"), config).unwrap();
+    assert_eq!(with_string(ntx_publisher_announce, publisher, LYRICS), NTX_OK);
+    assert_eq!(
+        update_text(ntx_publisher_update_text, publisher, "Welcome"),
+        NTX_OK
+    );
+    assert_eq!(
+        wait_for(|| event(ntx_publisher_wait_event, publisher, 5000), "connected")["relay"]["id"],
+        "c-relay"
+    );
+    let served = wait_for(|| event(ntx_relay_wait_event, relay, 5000), "publisher_connected");
+    assert_eq!(served["source"]["id"], "c-pub");
+
+    let receiver = connect(
+        &format!("127.0.0.1:{}", served["port"]),
+        r#"{"name": "C API (receiver)"}"#,
+    )
+    .unwrap();
+    let next = || event(ntx_receiver_wait_event, receiver, 5000);
+    assert_eq!(wait_for(next, "announce")[0]["ntxType"], "com.example.lyrics");
+    assert_eq!(wait_for(next, "update")["fields"]["text"], "Welcome");
+    let seq = update(
+        ntx_publisher_update,
+        publisher,
+        "com.example.lyrics",
+        r#"{"line": "Amazing grace"}"#,
+    );
+    assert!(seq.is_ok());
+    assert_eq!(wait_for(next, "update")["fields"]["line"], "Amazing grace");
+    assert_eq!(with_string(ntx_publisher_clear, publisher, "program"), NTX_OK);
+    assert_eq!(wait_for(next, "update")["fields"], json!({}));
+
+    assert_eq!(set_tally(receiver, true), NTX_OK);
+    assert_eq!(
+        wait_for(|| event(ntx_publisher_wait_event, publisher, 5000), "tally"),
+        json!({"program": true, "preview": false})
+    );
+
+    receiver_free(receiver);
+    // SAFETY: handles from this library, freed once.
+    unsafe { ntx_publisher_free(publisher) };
+    assert_eq!(
+        wait_for(
+            || event(ntx_relay_wait_event, relay, 5000),
+            "publisher_disconnected"
+        )["connection"],
+        1
+    );
+    // SAFETY: as above.
+    unsafe { ntx_relay_free(relay) };
+}
+
+#[test]
+fn publisher_and_relay_errors() {
+    assert_eq!(
+        publisher_connect("http://x", r#"{"name":"p"}"#),
+        Err(NTX_ERR_FAILED)
+    );
+    assert_eq!(
+        publisher_connect("localhost", r#"{"nme":"p"}"#),
+        Err(NTX_ERR_ARGUMENT)
+    );
+    assert_eq!(
+        with_string(ntx_relay_allow_origin, ptr::null(), "x"),
+        NTX_ERR_ARGUMENT
+    );
+    assert_eq!(event(ntx_relay_wait_event, ptr::null(), 0), None);
+    // SAFETY: a null config is allowed and reported.
+    let code = unsafe { ntx_relay_start(ptr::null(), ptr::null_mut()) };
+    assert_eq!(code, NTX_ERR_ARGUMENT);
+    // SAFETY: freeing null is allowed.
+    unsafe { ntx_publisher_free(ptr::null_mut()) };
+    // SAFETY: freeing null is allowed.
+    unsafe { ntx_relay_free(ptr::null_mut()) };
 }

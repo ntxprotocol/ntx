@@ -2,20 +2,13 @@ use std::collections::HashMap;
 use std::sync::{Mutex, mpsc};
 use std::time::Duration;
 
-use tokio::net::TcpStream;
 use tokio::sync::watch;
-use tokio_tungstenite::MaybeTlsStream;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
 
-use crate::protocol::{
-    Endpoint, ErrorCode, Hello, Message, PairingProof, Subscribe, Tally, TypeDescriptor, Update,
-};
+use crate::client::{self, Client, Connection, Role, Settings};
+use crate::protocol::{Endpoint, ErrorCode, Hello, Message, Tally, TypeDescriptor, Update};
 use crate::runtime::runtime;
-use crate::wire::{self, Ended, HANDSHAKE_TIMEOUT, HEARTBEAT_INTERVAL, Peer, lock};
-use crate::{DEFAULT_PORT, Error, PROGRAM, PROTOCOL_VERSION, Result, SUBPROTOCOL, pairing};
-
-type Connection = Peer<MaybeTlsStream<TcpStream>>;
+use crate::wire::{self, Ended, HEARTBEAT_INTERVAL, lock};
+use crate::{PROGRAM, Result};
 
 /// Settings for a [`Receiver`].
 #[derive(Debug, Clone)]
@@ -95,17 +88,26 @@ impl Receiver {
     ///
     /// Fails if `address` is not a valid address.
     pub fn connect(address: &str, config: ReceiverConfig) -> Result<Receiver> {
-        let url = normalize_url(address)?;
+        let url = client::normalize_url(address, "/")?;
         let (events_tx, events_rx) = mpsc::channel();
         let (tally, tally_rx) = watch::channel(None);
         let (stop, stop_rx) = watch::channel(false);
+        let settings = Settings::new(
+            Role::Receiver,
+            url.clone(),
+            config.id,
+            config.name,
+            config.channels,
+            config.pairing_code,
+            config.reconnect,
+        );
         let link = Link {
-            url: url.clone(),
-            config,
+            settings,
             events: events_tx,
             tally: tally_rx,
+            seen: Seen::default(),
         };
-        runtime().spawn(link.run(stop_rx));
+        runtime().spawn(client::keep_connected(link, stop_rx));
         Ok(Receiver {
             events: Mutex::new(events_rx),
             tally,
@@ -142,36 +144,12 @@ impl Drop for Receiver {
     }
 }
 
-/// Turns `host`, `host:port` or a `ws://` / `wss://` URL into a URL.
-fn normalize_url(address: &str) -> Result<String> {
-    let address = address.trim();
-    if address.starts_with("ws://") || address.starts_with("wss://") {
-        return Ok(address.to_string());
-    }
-    if address.is_empty() || address.contains(char::is_whitespace) || address.contains("://") {
-        return Err(Error::InvalidAddress(address.to_string()));
-    }
-    let colons = address.matches(':').count();
-    let (host, has_port) = if address.starts_with('[') {
-        (address.to_string(), address.contains("]:"))
-    } else if colons > 1 {
-        (format!("[{address}]"), false) // bare IPv6 address
-    } else {
-        (address.to_string(), colons == 1)
-    };
-    Ok(if has_port {
-        format!("ws://{host}/")
-    } else {
-        format!("ws://{host}:{DEFAULT_PORT}/")
-    })
-}
-
 /// The background task behind a [`Receiver`].
 struct Link {
-    url: String,
-    config: ReceiverConfig,
+    settings: Settings,
     events: mpsc::Sender<ReceiverEvent>,
     tally: watch::Receiver<Option<Tally>>,
+    seen: Seen,
 }
 
 /// Session and last applied sequence number per channel (clause 9.4).
@@ -202,99 +180,36 @@ impl Seen {
     }
 }
 
-impl Link {
-    /// Connects, and reconnects with backoff (clause 11.3), until stopped.
-    async fn run(mut self, mut stop: watch::Receiver<bool>) {
-        let mut seen = Seen::default();
-        let mut backoff = Duration::from_secs(1);
-        loop {
-            let (Ended(reason), handshook) = tokio::select! {
-                ended = self.session(&mut seen) => ended,
-                _ = stop.changed() => return,
-            };
-            if self.events.send(ReceiverEvent::Disconnected { reason }).is_err() || !self.config.reconnect {
-                return;
-            }
-            if handshook {
-                backoff = Duration::from_secs(1);
-            }
-            tokio::select! {
-                () = tokio::time::sleep(backoff) => {}
-                _ = stop.changed() => return,
-            }
-            backoff = (backoff * 2).min(Duration::from_secs(10));
-        }
+impl Client for Link {
+    fn settings(&self) -> &Settings {
+        &self.settings
     }
 
-    /// One connection. Returns why it ended and whether the handshake had finished.
-    async fn session(&mut self, seen: &mut Seen) -> (Ended, bool) {
-        let (mut peer, hello) = match tokio::time::timeout(HANDSHAKE_TIMEOUT, self.handshake()).await {
-            Ok(Ok(connected)) => connected,
-            Ok(Err(ended)) => return (ended, false),
-            Err(_) => return (Ended("no hello from source".into()), false),
-        };
-        seen.start_session(&hello.session);
+    async fn connected(&mut self, mut peer: Connection, hello: Hello) -> Ended {
+        self.seen.start_session(&hello.session);
         let _ = self.events.send(ReceiverEvent::Connected {
             source: hello.source,
             session: hello.session,
             channels: hello.channels,
         });
-        (self.receive(&mut peer, seen).await, true)
+        self.receive(&mut peer).await
     }
 
-    /// Connects, waits for `hello` and answers with `subscribe` (clause 8).
-    async fn handshake(&self) -> std::result::Result<(Connection, Hello), Ended> {
-        let mut request = self
-            .url
-            .as_str()
-            .into_client_request()
-            .map_err(|e| Ended(e.to_string()))?;
-        request
-            .headers_mut()
-            .insert("sec-websocket-protocol", HeaderValue::from_static(SUBPROTOCOL));
-        let (ws, _) = tokio_tungstenite::connect_async_with_config(request, Some(wire::ws_config()), true)
-            .await
-            .map_err(|e| Ended(e.to_string()))?;
-        let mut peer = Peer::new(ws, "hello");
-        let hello = match peer.recv().await? {
-            Message::Hello(hello) => hello,
-            Message::Error(e) => return Err(Ended(format!("source error: {}", e.code.as_str()))),
-            _ => return Err(peer.reject(ErrorCode::BadMessage, "expected hello".into()).await),
-        };
-        if let Err((code, reason)) = wire::check_version(&hello.ntx) {
-            return Err(peer.reject(code, reason).await);
-        }
-        let pairing =
-            hello
-                .pairing
-                .as_ref()
-                .zip(self.config.pairing_code.as_ref())
-                .map(|(challenge, code)| PairingProof {
-                    proof: pairing::proof(code, &challenge.nonce),
-                });
-        peer.send(&Message::Subscribe(Subscribe {
-            ntx: PROTOCOL_VERSION.to_string(),
-            receiver: Endpoint {
-                id: self.config.id.clone(),
-                name: self.config.name.clone(),
-            },
-            channels: Some(self.config.channels.clone()),
-            pairing,
-        }))
-        .await?;
-        peer.handshake_done();
-        Ok((peer, hello))
+    fn disconnected(&mut self, reason: String) -> bool {
+        self.events.send(ReceiverEvent::Disconnected { reason }).is_ok()
     }
+}
 
+impl Link {
     /// Receives until the connection ends, sending tally whenever it changes.
-    async fn receive(&mut self, peer: &mut Connection, seen: &mut Seen) -> Ended {
+    async fn receive(&mut self, peer: &mut Connection) -> Ended {
         self.tally.mark_changed(); // send the current tally, if any, on every new connection
         let mut tick = tokio::time::interval(HEARTBEAT_INTERVAL);
         loop {
             let outcome = tokio::select! {
                 message = peer.recv() => match message {
                     Ok(message) => {
-                        self.handle(message, seen);
+                        self.handle(message);
                         Ok(())
                     }
                     Err(ended) => Err(ended),
@@ -315,9 +230,9 @@ impl Link {
         }
     }
 
-    fn handle(&self, message: Message, seen: &mut Seen) {
+    fn handle(&mut self, message: Message) {
         let event = match message {
-            Message::Update(update) if seen.is_new(&update) => ReceiverEvent::Update(Update {
+            Message::Update(update) if self.seen.is_new(&update) => ReceiverEvent::Update(Update {
                 fields: wire::normalize_fields(update.fields),
                 ..update
             }),
@@ -335,20 +250,6 @@ impl Link {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn addresses() {
-        assert_eq!(normalize_url("192.168.1.20").unwrap(), "ws://192.168.1.20:7686/");
-        assert_eq!(normalize_url(" pc.local:9000 ").unwrap(), "ws://pc.local:9000/");
-        assert_eq!(normalize_url("ws://pc:1/a").unwrap(), "ws://pc:1/a");
-        assert_eq!(normalize_url("wss://pc/").unwrap(), "wss://pc/");
-        assert_eq!(normalize_url("fe80::1").unwrap(), "ws://[fe80::1]:7686/");
-        assert_eq!(normalize_url("[fe80::1]").unwrap(), "ws://[fe80::1]:7686/");
-        assert_eq!(normalize_url("[fe80::1]:9").unwrap(), "ws://[fe80::1]:9/");
-        for bad in ["http://x", "", "a b"] {
-            assert!(normalize_url(bad).is_err(), "{bad}");
-        }
-    }
 
     #[test]
     fn sequence_numbers() {

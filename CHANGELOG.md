@@ -17,3 +17,9 @@ All notable changes are listed here. The format follows
 - `ntx-ffi`: C ABI (opaque handles, JSON settings and events, polling), `ntx.h` header generated
   by cbindgen, and a C example that is compiled and run by the tests.
 - Events serialise to JSON (`{"event": ..., "data": ...}`).
+- Publishing through a relay (spec clause 14): `Publisher` sends text through a relay, with
+  pairing, tally events and reconnection; `Relay` serves each publisher to the network as a
+  source, checks web page origins against an allow-list (`origin_requested` events,
+  `allow_origin`, `revoke_origin`) and keeps each published source on the same port when its
+  publisher reconnects. Also in the C ABI (`ntx_publisher_*`, `ntx_relay_*`) and the CLI
+  (`ntx publish`, `ntx relay`).

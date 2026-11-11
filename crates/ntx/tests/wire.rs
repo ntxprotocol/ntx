@@ -3,10 +3,12 @@
 
 mod common;
 
-use std::net::TcpListener;
 use std::time::Duration;
 
-use common::{Raw, WAIT, raw_connect, read_close, read_json, receiver_config, send_json, source, wait_for};
+use common::{
+    Raw, WAIT, accept, fake_server, raw_connect, read, read_close, read_json, receiver_config, send_json,
+    source, wait_for, write,
+};
 use ntx::protocol::ErrorCode;
 use ntx::{Receiver, ReceiverEvent, SourceEvent};
 use serde_json::{Value, json};
@@ -121,39 +123,6 @@ fn source_closes_when_dropped() {
     assert_eq!(read_close(&mut ws), 1005);
 }
 
-/// A fake source: accepts one receiver and hands back the raw socket.
-fn fake_source() -> (TcpListener, String) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("ws://{}/", listener.local_addr().unwrap());
-    (listener, url)
-}
-
-#[allow(clippy::result_large_err)] // the callback's error type comes from tungstenite
-fn accept(listener: &TcpListener) -> tungstenite::WebSocket<std::net::TcpStream> {
-    let (stream, _) = listener.accept().unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let confirm_ntx = |_: &tungstenite::handshake::server::Request,
-                       mut response: tungstenite::handshake::server::Response| {
-        response
-            .headers_mut()
-            .insert("sec-websocket-protocol", "ntx".parse().unwrap());
-        Ok(response)
-    };
-    tungstenite::accept_hdr(stream, confirm_ntx).unwrap()
-}
-
-fn read<S: std::io::Read + std::io::Write>(ws: &mut tungstenite::WebSocket<S>) -> Value {
-    loop {
-        if let WsMessage::Text(text) = ws.read().unwrap() {
-            return serde_json::from_str(&text).unwrap();
-        }
-    }
-}
-
-fn write<S: std::io::Read + std::io::Write>(ws: &mut tungstenite::WebSocket<S>, value: &Value) {
-    ws.send(WsMessage::text(value.to_string())).unwrap();
-}
-
 fn hello(ntx: &str) -> Value {
     json!({"op": "hello", "ntx": ntx, "source": {"id": "fake", "name": "FAKE"}, "channels": ["program"], "session": "s1"})
 }
@@ -186,7 +155,7 @@ fn receiver_rejects_other_versions_and_bad_hellos() {
         (json!({"op": "error", "code": "not_allowed"}), None),
     ];
     for (first, answer) in cases {
-        let (listener, url) = fake_source();
+        let (listener, url) = fake_server("/");
         let r = one_shot_receiver(&url);
         let mut ws = accept(&listener);
         write(&mut ws, &first);
@@ -200,7 +169,7 @@ fn receiver_rejects_other_versions_and_bad_hellos() {
 
 #[test]
 fn receiver_filters_repeats_and_reports_everything_else() {
-    let (listener, url) = fake_source();
+    let (listener, url) = fake_server("/");
     let r = one_shot_receiver(&url);
     let mut ws = accept(&listener);
     write(&mut ws, &hello("0.1"));
@@ -247,7 +216,7 @@ fn receiver_filters_repeats_and_reports_everything_else() {
 
 #[test]
 fn receiver_pings_a_quiet_source_and_gives_up_on_a_silent_one() {
-    let (listener, url) = fake_source();
+    let (listener, url) = fake_server("/");
     let r = one_shot_receiver(&url);
     let mut ws = accept(&listener);
     write(&mut ws, &hello("0.1"));
@@ -268,7 +237,7 @@ fn receiver_pings_a_quiet_source_and_gives_up_on_a_silent_one() {
 
 #[test]
 fn receiver_reports_a_refused_connection() {
-    let (listener, url) = fake_source();
+    let (listener, url) = fake_server("/");
     drop(listener);
     let r = one_shot_receiver(&url);
     assert_ne!(disconnect_reason(&r), "");

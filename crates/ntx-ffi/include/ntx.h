@@ -33,8 +33,14 @@
 // An mDNS browser looking for sources.
 typedef struct NtxBrowser NtxBrowser;
 
+// A publisher connected (or connecting) to a relay.
+typedef struct NtxPublisher NtxPublisher;
+
 // A receiver connected (or connecting) to one source.
 typedef struct NtxReceiver NtxReceiver;
+
+// A running relay.
+typedef struct NtxRelay NtxRelay;
 
 // A running source.
 typedef struct NtxSource NtxSource;
@@ -189,6 +195,114 @@ char *ntx_browser_wait_event(const struct NtxBrowser *browser,
 //
 // `browser` is null or a handle from [`ntx_browser_start`] that has not been freed.
 void ntx_browser_free(struct NtxBrowser *browser);
+
+// Connects to the relay at `address` (a `ws://` URL, or `host[:port]` for the path
+// `/publish`). `config_json` is an object with `name` and optionally `id`, `channels`,
+// `pairing_code` and `reconnect`. On success `*out` receives the handle; free it with
+// [`ntx_publisher_free`].
+//
+// # Safety
+//
+// Pointers must be null or valid: NUL-terminated UTF-8 strings, live handles (see `ntx.h`).
+int ntx_publisher_connect(const char *address, const char *config_json, struct NtxPublisher **out);
+
+// Replaces the item of `channel` with `fields_json` (an object) of type `type_name`, and sends
+// it to the relay. If `seq_out` is not null it receives the sequence number.
+//
+// # Safety
+//
+// Pointers must be null or valid: NUL-terminated UTF-8 strings, live handles (see `ntx.h`).
+int ntx_publisher_update(const struct NtxPublisher *publisher,
+                         const char *channel,
+                         const char *type_name,
+                         const char *fields_json,
+                         uint64_t *seq_out);
+
+// Sends plain text on `channel` as an `ntx.text` item.
+//
+// # Safety
+//
+// Pointers must be null or valid: NUL-terminated UTF-8 strings, live handles (see `ntx.h`).
+int ntx_publisher_update_text(const struct NtxPublisher *publisher,
+                              const char *channel,
+                              const char *text);
+
+// Clears `channel`.
+//
+// # Safety
+//
+// Pointers must be null or valid: NUL-terminated UTF-8 strings, live handles (see `ntx.h`).
+int ntx_publisher_clear(const struct NtxPublisher *publisher, const char *channel);
+
+// Sets the announced types: `types_json` is an array of type descriptors (spec clause 15.4).
+//
+// # Safety
+//
+// Pointers must be null or valid: NUL-terminated UTF-8 strings, live handles (see `ntx.h`).
+int ntx_publisher_announce(const struct NtxPublisher *publisher, const char *types_json);
+
+// Waits up to `timeout_ms` (0 = just check) for the next event, as JSON such as
+// `{"event":"tally","data":{"program":true,"preview":false}}`. Returns null when there is none.
+//
+// # Safety
+//
+// Pointers must be null or valid: NUL-terminated UTF-8 strings, live handles (see `ntx.h`).
+char *ntx_publisher_wait_event(const struct NtxPublisher *publisher, uint32_t timeout_ms);
+
+// Disconnects and frees the handle. Null is ignored.
+//
+// # Safety
+//
+// `publisher` is null or a handle from [`ntx_publisher_connect`] that has not been freed.
+void ntx_publisher_free(struct NtxPublisher *publisher);
+
+// Starts a relay, which turns publishing on (spec clause 14). `config_json` is an object with
+// `name` and optionally `id`, `bind`, `port`, `path`, `pairing_code`, `allowed_origins` and
+// `advertise` (see `RelayConfig` in the Rust docs). On success `*out` receives the handle; free
+// it with [`ntx_relay_free`].
+//
+// # Safety
+//
+// Pointers must be null or valid: NUL-terminated UTF-8 strings, live handles (see `ntx.h`).
+int ntx_relay_start(const char *config_json, struct NtxRelay **out);
+
+// Allows web pages from `origin` (e.g. `"https://example.com"`) to publish. Call it when the
+// user agrees to an `origin_requested` event.
+//
+// # Safety
+//
+// Pointers must be null or valid: NUL-terminated UTF-8 strings, live handles (see `ntx.h`).
+int ntx_relay_allow_origin(const struct NtxRelay *relay, const char *origin);
+
+// Withdraws permission from `origin` and disconnects its publishers.
+//
+// # Safety
+//
+// Pointers must be null or valid: NUL-terminated UTF-8 strings, live handles (see `ntx.h`).
+int ntx_relay_revoke_origin(const struct NtxRelay *relay, const char *origin);
+
+// Waits up to `timeout_ms` (0 = just check) for the next event, as JSON such as
+// `{"event":"origin_requested","data":{"origin":"https://example.com"}}`. Returns null when
+// there is none.
+//
+// # Safety
+//
+// Pointers must be null or valid: NUL-terminated UTF-8 strings, live handles (see `ntx.h`).
+char *ntx_relay_wait_event(const struct NtxRelay *relay, uint32_t timeout_ms);
+
+// The address the relay listens on, as JSON: `{"address":"127.0.0.1:7686"}`.
+//
+// # Safety
+//
+// Pointers must be null or valid: NUL-terminated UTF-8 strings, live handles (see `ntx.h`).
+char *ntx_relay_info(const struct NtxRelay *relay);
+
+// Stops the relay, disconnects its publishers and frees the handle. Null is ignored.
+//
+// # Safety
+//
+// `relay` is null or a handle from [`ntx_relay_start`] that has not been freed.
+void ntx_relay_free(struct NtxRelay *relay);
 
 #ifdef __cplusplus
 }  // extern "C"

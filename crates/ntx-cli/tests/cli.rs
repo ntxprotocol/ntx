@@ -8,24 +8,17 @@ use std::time::Duration;
 const NTX: &str = env!("CARGO_BIN_EXE_ntx");
 const WAIT: Duration = Duration::from_secs(10);
 
-/// A running `ntx send`, with its address and a feed of its log lines.
-struct Sender {
+/// A running `ntx` command, with its standard input and a feed of its log lines.
+struct Running {
     child: Child,
     stdin: ChildStdin,
-    address: String,
     log: mpsc::Receiver<String>,
 }
 
-impl Sender {
-    fn start(extra: &[&str]) -> Sender {
+impl Running {
+    fn start(args: &[&str]) -> Running {
         let mut child = Command::new(NTX)
-            .args(["send", "--port", "0"])
-            .args(if extra.contains(&"--name") {
-                &[][..]
-            } else {
-                &["--name", "surface test"][..]
-            })
-            .args(extra)
+            .args(args)
             .stdin(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -39,25 +32,7 @@ impl Sender {
                 .map_while(Result::ok)
                 .for_each(|l| drop(tx.send(l)));
         });
-        let mut sender = Sender {
-            child,
-            stdin,
-            address: String::new(),
-            log,
-        };
-        let line = sender.expect("listening on ws://");
-        let port = line
-            .split("ws://")
-            .nth(1)
-            .unwrap()
-            .split('/')
-            .next()
-            .unwrap()
-            .rsplit(':')
-            .next()
-            .unwrap();
-        sender.address = format!("127.0.0.1:{port}");
-        sender
+        Running { child, stdin, log }
     }
 
     fn line(&mut self, text: &str) {
@@ -77,11 +52,32 @@ impl Sender {
         }
     }
 
+    /// Waits for a log line containing `needle` followed by a port or a URL with a port, and
+    /// returns `127.0.0.1:<port>`.
+    fn expect_port(&self, needle: &str) -> String {
+        let line = self.expect(needle);
+        let after = line.split(needle).nth(1).unwrap();
+        let address = after.split(['/', ' ', ',']).next().unwrap();
+        format!("127.0.0.1:{}", address.rsplit(':').next().unwrap())
+    }
+
     /// Closes standard input and returns the exit status.
     fn finish(mut self) -> std::process::ExitStatus {
         drop(self.stdin);
         self.child.wait().unwrap()
     }
+}
+
+/// Starts `ntx send` on any free port; returns it and its address.
+fn sender(extra: &[&str]) -> (Running, String) {
+    let name: &[&str] = if extra.contains(&"--name") {
+        &[]
+    } else {
+        &["--name", "surface test"]
+    };
+    let sender = Running::start(&[&["send", "--port", "0"], name, extra].concat());
+    let address = sender.expect_port("listening on ws://");
+    (sender, address)
 }
 
 /// Runs `ntx recv` until it has printed `count` updates.
@@ -119,10 +115,10 @@ fn help_and_version() {
 
 #[test]
 fn send_and_receive_text() {
-    let mut sender = Sender::start(&["--no-mdns"]);
+    let (mut sender, address) = sender(&["--no-mdns"]);
     sender.line("Welcome");
     sender.expect("sent seq 1");
-    let receiver = recv(&sender.address, 3, &["--field", "text", "--on-air"]);
+    let receiver = recv(&address, 3, &["--field", "text", "--on-air"]);
     sender.expect("+ receiver");
     sender.expect("tally: on air true");
     sender.line("Amazing grace");
@@ -138,7 +134,7 @@ fn send_and_receive_text() {
 
 #[test]
 fn json_fields_patterns_and_preview() {
-    let mut sender = Sender::start(&[
+    let (mut sender, address) = sender(&[
         "--no-mdns",
         "--json",
         "--type",
@@ -148,7 +144,7 @@ fn json_fields_patterns_and_preview() {
         "preview",
     ]);
     let receiver = recv(
-        &sender.address,
+        &address,
         2,
         &["--channel", "preview", "--pattern", "{reference} · {version}"],
     );
@@ -161,10 +157,10 @@ fn json_fields_patterns_and_preview() {
 
 #[test]
 fn raw_json_output_and_pairing() {
-    let mut sender = Sender::start(&["--no-mdns", "--pair", "2468", "--id", "fixed-id"]);
+    let (mut sender, address) = sender(&["--no-mdns", "--pair", "2468", "--id", "fixed-id"]);
     sender.line("secret");
     sender.expect("sent seq 1");
-    let receiver = recv(&sender.address, 1, &["--pair", "2468"]);
+    let receiver = recv(&address, 1, &["--pair", "2468"]);
     let output = receiver.join().unwrap();
     let update: serde_json::Value = serde_json::from_str(&stdout(&output)[0]).unwrap();
     assert_eq!(update["fields"]["text"], "secret");
@@ -174,7 +170,7 @@ fn raw_json_output_and_pairing() {
 
 #[test]
 fn bad_input_fails_cleanly() {
-    let mut sender = Sender::start(&["--no-mdns", "--json"]);
+    let (mut sender, _) = sender(&["--no-mdns", "--json"]);
     sender.line("not json");
     let status = sender.finish();
     assert!(!status.success());
@@ -194,7 +190,7 @@ fn bad_input_fails_cleanly() {
 fn list_finds_an_advertised_sender() {
     // Longer than a DNS label (63 bytes): the advertised name must be shortened, not dropped.
     let name = format!("surface test {}", "x".repeat(60));
-    let sender = Sender::start(&["--id", "surface-list", "--name", &name]);
+    let (sender, _) = sender(&["--id", "surface-list", "--name", &name]);
     let output = Command::new(NTX)
         .args(["list", "--seconds", "6"])
         .output()
@@ -223,4 +219,63 @@ fn list_finds_an_advertised_sender() {
         .output()
         .unwrap();
     assert!(String::from_utf8_lossy(&nothing.stderr).contains("no NTX sources found"));
+}
+
+/// Starts `ntx relay` on any free port; returns it and its address.
+fn relay(extra: &[&str]) -> (Running, String) {
+    let relay = Running::start(&[&["relay", "--port", "0", "--no-mdns"], extra].concat());
+    let address = relay.expect_port("listening on ws://");
+    (relay, address)
+}
+
+#[test]
+fn publish_through_a_relay() {
+    let (relay, relay_address) = relay(&["--pair", "1357"]);
+    let url = format!("ws://{relay_address}/publish");
+
+    let mut unpaired = Running::start(&["publish", &url]);
+    unpaired.expect("relay error: pairing_required");
+    unpaired.line("not sent");
+    assert!(unpaired.finish().success());
+
+    let mut publisher = Running::start(&[
+        "publish",
+        &relay_address,
+        "--name",
+        "surface publish",
+        "--pair",
+        "1357",
+        "--preview",
+    ]);
+    publisher.expect("connected to relay");
+    publisher.line("Welcome");
+    publisher.expect("sent seq 1");
+    let source = relay.expect_port("served on port ");
+    let receiver = recv(&source, 2, &["--field", "text", "--on-air"]);
+    publisher.expect("tally: on air true");
+    publisher.line("Amazing grace");
+    let output = receiver.join().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(stdout(&output), ["Welcome", "Amazing grace"]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("(surface publish)"));
+    assert!(publisher.finish().success());
+    relay.expect("- publisher");
+    assert!(relay.finish().success());
+}
+
+#[test]
+fn relay_refuses_web_pages_unless_allowed() {
+    let (relay, address) = relay(&["--allow-origin", "https://ok.example"]);
+    let connect = |origin: &str| {
+        let mut request =
+            tungstenite::client::IntoClientRequest::into_client_request(format!("ws://{address}/publish"))
+                .unwrap();
+        request.headers_mut().insert("origin", origin.parse().unwrap());
+        let (mut ws, _) = tungstenite::connect(request).unwrap();
+        ws.read().unwrap().into_text().unwrap().to_string()
+    };
+    assert!(connect("https://bad.example").contains("not_allowed"));
+    relay.expect("refused a page from https://bad.example");
+    assert!(connect("https://ok.example").contains("\"hello\""));
+    assert!(relay.finish().success());
 }

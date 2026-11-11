@@ -1,20 +1,29 @@
-//! The WebSocket side shared by sources and receivers: sending, receiving, heartbeats and errors.
+//! The WebSocket side shared by every endpoint: listening, sending, receiving, heartbeats and
+//! errors.
 
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
-use crate::protocol::{ErrorCode, ErrorMessage, Fields, Heartbeat, Message};
-use crate::{Error, MAX_MESSAGE_BYTES, PROTOCOL_VERSION, text};
+use crate::protocol::{
+    ErrorCode, ErrorMessage, Fields, Heartbeat, Hello, Message, PairingChallenge, PairingProof,
+};
+use crate::runtime::runtime;
+use crate::{Error, MAX_MESSAGE_BYTES, PROTOCOL_VERSION, SUBPROTOCOL, pairing, text};
 
 /// Ping when nothing has been received for this long (clause 11.2).
 const PING_AFTER: Duration = Duration::from_secs(5);
@@ -57,6 +66,142 @@ fn normalize_strings(value: &mut Value) {
         Value::Array(items) => items.iter_mut().for_each(normalize_strings),
         Value::Object(map) => map.values_mut().for_each(normalize_strings),
         _ => {}
+    }
+}
+
+/// Opens a listening TCP socket for the background runtime.
+pub(crate) fn listen(bind: IpAddr, port: u16) -> crate::Result<(TcpListener, SocketAddr)> {
+    let listener = std::net::TcpListener::bind((bind, port))?;
+    listener.set_nonblocking(true)?;
+    let local_addr = listener.local_addr()?;
+    let _guard = runtime().enter();
+    Ok((TcpListener::from_std(listener)?, local_addr))
+}
+
+/// Accepts connections on the background runtime, serving each one on its own task with
+/// `serve(stream, address, shared, stop)`. Stops when the returned sender sends `true`.
+pub(crate) fn serve_connections<T, Fut>(
+    listener: TcpListener,
+    shared: Arc<T>,
+    serve: fn(TcpStream, SocketAddr, Arc<T>, watch::Receiver<bool>) -> Fut,
+) -> watch::Sender<bool>
+where
+    T: Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let (stop, stop_rx) = watch::channel(false);
+    runtime().spawn(accept_loop(listener, shared, serve, stop_rx));
+    stop
+}
+
+async fn accept_loop<T, Fut>(
+    listener: TcpListener,
+    shared: Arc<T>,
+    serve: fn(TcpStream, SocketAddr, Arc<T>, watch::Receiver<bool>) -> Fut,
+    mut stop: watch::Receiver<bool>,
+) where
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, address)) => {
+                    let _ = stream.set_nodelay(true);
+                    tokio::spawn(serve(stream, address, shared.clone(), stop.clone()));
+                }
+                Err(e) => {
+                    tracing::warn!("accept failed: {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            },
+            _ = stop.changed() => break,
+        }
+    }
+}
+
+/// Accepts a WebSocket upgrade on `path` only. Returns the connection, expecting `handshake` as
+/// its first message, and the HTTP `Origin` header if there is one (clause 14.5).
+#[allow(clippy::result_large_err)] // the upgrade callback's error type comes from tungstenite
+pub(crate) async fn accept(
+    stream: TcpStream,
+    path: &str,
+    handshake: &'static str,
+) -> Result<(Peer<TcpStream>, Option<String>), Ended> {
+    let mut origin = None;
+    let upgrade = tokio_tungstenite::accept_hdr_async_with_config(
+        stream,
+        |request: &Request, response: Response| {
+            origin = request
+                .headers()
+                .get("origin")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
+            check_upgrade(path, request, response)
+        },
+        Some(ws_config()),
+    );
+    let ws = upgrade.await.map_err(|e| Ended(e.to_string()))?;
+    Ok((Peer::new(ws, handshake), origin))
+}
+
+/// Accepts the upgrade only on `path`, and confirms the `ntx` subprotocol if offered (clause 5.2).
+#[allow(clippy::result_large_err)] // signature required by tungstenite
+fn check_upgrade(path: &str, request: &Request, mut response: Response) -> Result<Response, ErrorResponse> {
+    if request.uri().path() != path {
+        let mut not_found = ErrorResponse::new(Some("no NTX endpoint at this path".into()));
+        *not_found.status_mut() = StatusCode::NOT_FOUND;
+        return Err(not_found);
+    }
+    let offered = request
+        .headers()
+        .get_all("sec-websocket-protocol")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|p| p.trim() == SUBPROTOCOL);
+    if offered {
+        response
+            .headers_mut()
+            .insert("sec-websocket-protocol", HeaderValue::from_static(SUBPROTOCOL));
+    }
+    Ok(response)
+}
+
+/// Serialises a message, enforcing the size limit (clause 18.1).
+pub(crate) fn frame(message: &Message) -> crate::Result<WsMessage> {
+    let json = message.to_json();
+    if json.len() > MAX_MESSAGE_BYTES {
+        return Err(Error::TooLarge(json.len()));
+    }
+    Ok(WsMessage::text(json))
+}
+
+/// Runs a connection after its handshake until it ends: sends queued frames, passes received
+/// messages to `handle`, keeps the heartbeat (clause 11) and closes when `stop` completes.
+pub(crate) async fn pump<S: AsyncRead + AsyncWrite + Unpin>(
+    peer: &mut Peer<S>,
+    out: &mut mpsc::UnboundedReceiver<WsMessage>,
+    stop: impl Future<Output = ()>,
+    mut handle: impl FnMut(Message),
+) -> Ended {
+    tokio::pin!(stop);
+    let mut tick = tokio::time::interval(HEARTBEAT_INTERVAL);
+    loop {
+        let outcome = tokio::select! {
+            frame = out.recv() => match frame {
+                Some(frame) => peer.send_frame(frame).await,
+                None => Err(Ended("closed".into())),
+            },
+            message = peer.recv() => message.map(&mut handle),
+            _ = tick.tick() => peer.heartbeat().await,
+            () = &mut stop => {
+                peer.close().await;
+                Err(Ended("stopped".into()))
+            }
+        };
+        if let Err(ended) = outcome {
+            return ended;
+        }
     }
 }
 
@@ -183,7 +328,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Peer<S> {
     }
 }
 
-fn bad_message(e: &Error) -> ErrorMessage {
+/// The `bad_message` error for `e`.
+pub(crate) fn bad_message(e: &Error) -> ErrorMessage {
     ErrorMessage {
         code: ErrorCode::BadMessage,
         message: Some(e.to_string()),
@@ -198,6 +344,56 @@ fn is_other_version(text: &str, op: &str) -> bool {
                 .and_then(Value::as_str)
                 .is_some_and(|n| n != PROTOCOL_VERSION)
     })
+}
+
+/// The server side of a handshake (clauses 8, 13 and 14.2): sends `hello`, with a pairing
+/// challenge when `pairing_code` is set, and waits for the answer that `pick` accepts. `pick`
+/// returns the answer with its version and pairing proof, which are then checked.
+pub(crate) async fn greet<T>(
+    peer: &mut Peer<TcpStream>,
+    mut hello: Hello,
+    pairing_code: Option<&str>,
+    pick: impl Fn(Message) -> Option<(T, String, Option<PairingProof>)>,
+) -> Result<T, Ended> {
+    let greeting = async {
+        let nonce = pairing_code.map(|_| pairing::new_nonce());
+        hello.pairing = nonce.clone().map(|nonce| PairingChallenge { nonce });
+        peer.send(&Message::Hello(hello)).await?;
+        let (answer, ntx, proof) = loop {
+            if let Some(found) = pick(peer.recv().await?) {
+                break found;
+            }
+        };
+        let pairing = pairing_code.zip(nonce.as_deref());
+        if let Err((code, reason)) = check_answer(&ntx, pairing, proof.as_ref()).await {
+            return Err(peer.reject(code, reason).await);
+        }
+        peer.handshake_done();
+        Ok(answer)
+    };
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, greeting)
+        .await
+        .unwrap_or_else(|_| Err(Ended("no answer to hello".into())))
+}
+
+/// Checks the version and pairing proof of a `subscribe` or `publish` (clauses 13.4, 19.3).
+/// `pairing` holds the pairing code and the nonce sent in `hello`, when pairing is required.
+async fn check_answer(
+    ntx: &str,
+    pairing: Option<(&str, &str)>,
+    proof: Option<&PairingProof>,
+) -> Result<(), (ErrorCode, String)> {
+    check_version(ntx)?;
+    if let Some((code, nonce)) = pairing {
+        let Some(proof) = proof else {
+            return Err((ErrorCode::PairingRequired, "a pairing code is needed".into()));
+        };
+        if !pairing::verify(code, nonce, &proof.proof) {
+            tokio::time::sleep(Duration::from_secs(1)).await; // slow down guessing (clause 13.4)
+            return Err((ErrorCode::PairingFailed, "wrong pairing code".into()));
+        }
+    }
+    Ok(())
 }
 
 /// Checks the version in a handshake message (clause 19.3).
