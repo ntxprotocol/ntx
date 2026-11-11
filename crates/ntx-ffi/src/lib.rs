@@ -1,6 +1,6 @@
 //! C ABI for NTX (Network Text Exchange).
 //!
-//! This is the one native interface that the C/C++, Python, Node, Java and .NET bindings wrap.
+//! This is the one native interface that the C/C++, Node, Java and .NET bindings wrap.
 //! It is kept small and stable:
 //!
 //! - Objects are opaque handles: [`NtxSource`], [`NtxReceiver`], [`NtxBrowser`],

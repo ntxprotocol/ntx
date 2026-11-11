@@ -28,8 +28,9 @@ sending text, not video, between apps on a local network.
 | [`crates/ntx`](crates/ntx) | Rust library: sources, receivers, publishers, relays, mDNS discovery, pairing, binding |
 | [`crates/ntx-cli`](crates/ntx-cli) | `ntx` command: a test sender, receiver, publisher and relay |
 | [`crates/ntx-ffi`](crates/ntx-ffi) | C library (`libntx_ffi`) and header [`ntx.h`](crates/ntx-ffi/include/ntx.h) |
+| [`bindings/python`](bindings/python) | Python package `ntx-protocol` (import `ntxprotocol`), built with PyO3 |
 
-Planned in this repository: thin wrappers for Python, Node, Java and .NET on top of the C library.
+Planned in this repository: thin wrappers for Node, Java and .NET.
 
 ## Try it
 

@@ -62,7 +62,7 @@ repos:
       - id: tests-and-coverage
         name: tests incl. surface tests, line coverage >= 90%
         language: system
-        entry: cargo llvm-cov --workspace --locked --fail-under-lines 90
+        entry: cargo llvm-cov --workspace --exclude ntx-python --locked --fail-under-lines 90
         pass_filenames: false
         always_run: true
         stages: [pre-push]
@@ -87,6 +87,34 @@ repos:
         pass_filenames: false
         always_run: true
         stages: [pre-push]
+
+  # Python bindings (bindings/python): lint, format and strict types before every commit,
+  # tests with Python and Rust binding coverage >= 90% before every push.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.4
+    hooks:
+      - id: ruff-check
+      - id: ruff-format
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v2.4.1
+    hooks:
+      - id: mypy
+        name: mypy --strict (Python bindings)
+        args: [--config-file, bindings/python/pyproject.toml]
+        additional_dependencies: [pytest==8.4.2]
+        files: ^bindings/python/
+        pass_filenames: false
+        entry: mypy bindings/python/python/ntxprotocol bindings/python/tests bindings/python/examples
+  - repo: local
+    hooks:
+      - id: python-tests-and-coverage
+        name: Python tests incl. surface tests, Python and Rust binding coverage >= 90%
+        language: python
+        additional_dependencies: [maturin==1.16.0, pytest==8.4.2, pytest-cov==7.1.0]
+        entry: bindings/python/coverage.sh
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
   - repo: local
     hooks:
       - id: no-duplicate-code
@@ -94,7 +122,7 @@ repos:
         language: node
         language_version: system
         additional_dependencies: [jscpd@4.0.5]
-        entry: jscpd crates --min-lines 6 --min-tokens 60 --threshold 0 --reporters console --silent
+        entry: jscpd crates bindings --min-lines 6 --min-tokens 60 --threshold 0 --reporters console --silent
         pass_filenames: false
         always_run: true
         stages: [pre-push]

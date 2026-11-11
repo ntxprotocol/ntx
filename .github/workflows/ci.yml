@@ -29,9 +29,59 @@ jobs:
           path: spec
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --locked
+      # The Python extension is tested by the `python` job.
+      - run: cargo test --workspace --exclude ntx-python --locked
         env:
           NTX_SPEC_DIR: ${{ github.workspace }}/spec
+
+  # Python bindings: build the package from source and run its tests (real sockets, mDNS and the
+  # example script) on the oldest and newest supported Python. Coverage is checked in `checks`.
+  python:
+    name: python ${{ matrix.python }} (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+        python: ["3.9", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install ./bindings/python pytest==8.4.2
+      - run: python -m pytest
+        working-directory: bindings/python
+
+  # abi3 wheels (one per platform, for Python 3.9+) for x64 and arm64. Kept as build artifacts;
+  # nothing is published.
+  wheels:
+    name: wheel (${{ matrix.os }}, ${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64 }
+          - { os: ubuntu-latest, target: aarch64 }
+          - { os: macos-latest, target: x86_64 }
+          - { os: macos-latest, target: aarch64 }
+          - { os: windows-latest, target: x64 }
+          - { os: windows-latest, target: aarch64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: bindings/python
+          target: ${{ matrix.target }}
+          manylinux: auto
+          args: --release --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}-${{ matrix.target }}
+          path: bindings/python/dist/*.whl
 
   # The same checks as the local pre-commit and pre-push hooks: format, lint, coverage >= 90%,
   # docs, licences and advisories, unused dependencies, duplicated code, secrets.

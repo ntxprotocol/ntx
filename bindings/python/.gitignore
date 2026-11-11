@@ -1,0 +1,5 @@
+# Built by `maturin develop`
+/python/ntxprotocol/*.so
+/python/ntxprotocol/*.pyd
+__pycache__/
+.coverage

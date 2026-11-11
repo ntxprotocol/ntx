@@ -1,7 +1,8 @@
 # ntx-ffi
 
 The C library for [NTX (Network Text Exchange)](https://github.com/ntxprotocol/spec). It is the one
-native interface that the C/C++, Python, Node, Java and .NET bindings wrap.
+native interface that the C/C++, Node, Java and .NET bindings wrap. (Python uses PyO3 instead; see
+[`bindings/python`](../../bindings/python).)
 
 - Header: [`include/ntx.h`](include/ntx.h), generated from [`src/lib.rs`](src/lib.rs) by cbindgen.
 - Library: `libntx_ffi` (`.so` / `.dylib` / `.dll`, and a static `.a` / `.lib`).

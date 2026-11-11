@@ -1,0 +1,71 @@
+[build-system]
+requires = ["maturin>=1.9.4,<2"]
+build-backend = "maturin"
+
+[project]
+name = "ntx-protocol"
+description = "NTX (Network Text Exchange): send text, not video, between apps on a local network"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT OR Apache-2.0"
+authors = [{ name = "CamelCase Technologies Ltd and the NTX contributors" }]
+keywords = ["ntx", "broadcast", "text", "protocol", "presentation"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Multimedia",
+    "Topic :: System :: Networking",
+    "Typing :: Typed",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://ntxprotocol.com"
+Repository = "https://github.com/ntxprotocol/ntx"
+Specification = "https://github.com/ntxprotocol/spec"
+
+[tool.maturin]
+python-source = "python"
+module-name = "ntxprotocol._ntx"
+locked = true
+
+[tool.ruff]
+line-length = 110
+target-version = "py39"
+src = ["python", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "N", "D", "SIM", "RUF", "PT", "C4", "PIE", "RET", "ANN", "S", "PL"]
+ignore = [
+    "S101",    # pytest uses assert
+    "PLR2004", # tests compare with literal values
+    "SIM117",  # nested `with` blocks: Python 3.9 has no parenthesised context managers
+    "PLR0913", # constructors take one keyword argument per setting, like the Rust config structs
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D", "S603", "ANN401"]
+"examples/*" = ["D"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.mypy]
+strict = true
+mypy_path = "$MYPY_CONFIG_FILE_DIR/python"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers"
+
+[tool.coverage.run]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 90

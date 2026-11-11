@@ -1,6 +1,6 @@
 [package]
 name = "ntx-ffi"
-description = "C ABI for NTX (Network Text Exchange), used by the C/C++, Python, Node, Java and .NET bindings"
+description = "C ABI for NTX (Network Text Exchange), used by the C/C++, Node, Java and .NET bindings"
 keywords = ["ntx", "ffi", "text", "protocol", "broadcast"]
 categories = ["network-programming", "external-ffi-bindings"]
 readme = "README.md"

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/ntx", "crates/ntx-cli", "crates/ntx-ffi"]
+members = ["crates/ntx", "crates/ntx-cli", "crates/ntx-ffi", "bindings/python"]
 
 [workspace.package]
 version = "0.1.0"
