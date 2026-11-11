@@ -34,6 +34,9 @@ const DEAD_AFTER: Duration = Duration::from_secs(15);
 /// How long the first message of a handshake may take (clause 8.6).
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long to wait for the peer to answer a close.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// How often [`Peer::heartbeat`] should be called.
 pub(crate) const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -258,13 +261,29 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Peer<S> {
         }));
         // The connection ends either way, so failures to send are not interesting.
         let _ = self.send(&error).await;
-        let _ = self.send_frame(close).await;
+        self.close_with(close).await;
         Ended(reason)
     }
 
     /// Closes the connection without an error.
     pub(crate) async fn close(&mut self) {
-        let _ = self.send_frame(WsMessage::Close(None)).await;
+        self.close_with(WsMessage::Close(None)).await;
+    }
+
+    /// Sends `close` and waits briefly for the peer to close too. Dropping a socket with unread
+    /// data resets the connection on some systems (Windows), and the peer would lose the last
+    /// messages, such as an `error`, before reading them.
+    async fn close_with(&mut self, close: WsMessage) {
+        if self.send_frame(close).await.is_ok() {
+            let drain = async {
+                while let Some(Ok(frame)) = self.stream.next().await {
+                    if frame.is_close() {
+                        break;
+                    }
+                }
+            };
+            let _ = tokio::time::timeout(CLOSE_TIMEOUT, drain).await;
+        }
     }
 
     /// Returns the next NTX message. Pings are answered and unknown ops skipped (clause 7.2).
