@@ -168,6 +168,15 @@ pre-commit run --all-files --hook-stage pre-push     # tests, coverage >= 90%, d
 
 Only CI runs the tests on Linux and Windows; the hooks lint those platforms' code from any computer.
 
+### Releases
+
+`scripts/release.sh` builds the `ntx` command and the C library for macOS (Apple silicon and Intel),
+Linux (x86-64 and ARM64, glibc 2.17 or newer) and Windows (x86-64), as archives with `ntx.h`, the
+licences and `SHA256SUMS`, in `dist/`. Linux and Windows are cross-built with
+[zig](https://ziglang.org) and [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild).
+Pushing a tag such as `v0.1.0-alpha.1` runs the same script in CI (`release.yml`) and creates a
+*draft* GitHub release for a maintainer to check and publish. Nothing goes to a package registry.
+
 On **Windows**, use the MSVC Rust toolchain (rustup's default) with the
 [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
 ("Desktop development with C++").
