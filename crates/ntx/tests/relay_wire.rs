@@ -342,3 +342,29 @@ fn pages_cannot_flood_the_user_with_questions() {
     ));
     assert_eq!(relay.wait_event(Duration::from_millis(300)), None);
 }
+
+#[test]
+fn a_publishers_wait_goes_back_to_one_second_after_a_long_connection() {
+    // A relay sends no update, so a connection that lasted 10 seconds resets the wait (11.3).
+    let (listener, url) = fake_server("/publish");
+    let _p = Publisher::connect(&url, publisher_config("pub-backoff", None)).unwrap();
+    // Accepts the next connection, answers its publish, and says how long it took to come.
+    let next = |since: std::time::Instant| {
+        let mut ws = accept(&listener);
+        let waited = since.elapsed();
+        write(&mut ws, &hello(None));
+        assert_eq!(read(&mut ws)["op"], "publish");
+        (ws, waited)
+    };
+    let (ws, _) = next(std::time::Instant::now());
+    drop(ws);
+    let (ws, first) = next(std::time::Instant::now());
+    drop(ws);
+    let (ws, second) = next(std::time::Instant::now());
+    assert!(first < Duration::from_millis(1800), "{first:?}");
+    assert!(second >= Duration::from_millis(1800), "{second:?}");
+    std::thread::sleep(Duration::from_millis(10_500));
+    drop(ws);
+    let (_ws, third) = next(std::time::Instant::now());
+    assert!(third < Duration::from_millis(1800), "{third:?}");
+}

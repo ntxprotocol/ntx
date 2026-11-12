@@ -231,12 +231,14 @@ fn publish(args: &PublishArgs) -> CliResult {
         PublisherEvent::Connected { relay, .. } => format!("connected to relay \"{}\"", relay.name),
         PublisherEvent::Tally(tally) => describe_tally(tally),
         PublisherEvent::Error { code, message } => {
-            let then = if code.needs_user() { " (not retrying)" } else { "" };
-            format!(
-                "relay error: {} {}{then}",
-                code.as_str(),
-                message.unwrap_or_default()
-            )
+            let error = format!("relay error: {} {}", code.as_str(), message.unwrap_or_default());
+            // The publisher stopped (clause 11.3). Reading standard input may block, so exit
+            // from here, like `recv` does.
+            if code.needs_user() {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+            error
         }
         PublisherEvent::Disconnected { reason } => format!("disconnected: {reason}"),
     };

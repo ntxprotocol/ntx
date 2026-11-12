@@ -21,7 +21,8 @@ use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 use crate::protocol::{
-    ErrorCode, ErrorMessage, Fields, Heartbeat, Hello, Message, PairingChallenge, PairingProof,
+    ErrorCode, ErrorMessage, Fields, Heartbeat, Hello, MAX_ERROR_CHARS, Message, PairingChallenge,
+    PairingProof,
 };
 use crate::runtime::runtime;
 use crate::{Error, MAX_MESSAGE_BYTES, PROTOCOL_VERSION, SUBPROTOCOL, pairing, text};
@@ -37,9 +38,6 @@ pub(crate) const TIMEOUT_CLOSE: u16 = 4008;
 
 /// How long the first message of a handshake may take (clause 8.6).
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Longest `message` in `error`, in bytes; the limit is 1024 characters (clause 12).
-const MAX_ERROR_MESSAGE: usize = 1024;
 
 /// Longest close reason: a close frame's payload is at most 125 bytes, two of them the code.
 const MAX_CLOSE_REASON: usize = 123;
@@ -396,7 +394,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Peer<S> {
     pub(crate) async fn reject(&mut self, code: ErrorCode, reason: String) -> Ended {
         let error = Message::Error(ErrorMessage {
             code,
-            message: Some(cut(&reason, MAX_ERROR_MESSAGE).to_string()),
+            message: Some(text::shorten(&reason, MAX_ERROR_CHARS, text::chars).to_string()),
         });
         // The connection ends either way, so failures to send are not interesting.
         let _ = self.send(&error).await;
@@ -410,7 +408,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Peer<S> {
     pub(crate) async fn close(&mut self, code: Option<(u16, &str)>) {
         let frame = code.map(|(code, reason)| CloseFrame {
             code: CloseCode::from(code),
-            reason: cut(reason, MAX_CLOSE_REASON).into(),
+            reason: text::shorten(reason, MAX_CLOSE_REASON, str::len).into(),
         });
         self.closing = self.send_frame(WsMessage::Close(frame)).await.is_ok();
     }
@@ -508,15 +506,6 @@ async fn drain<S: AsyncRead + AsyncWrite + Unpin>(mut stream: SplitStream<WebSoc
         }
     };
     let _ = tokio::time::timeout(CLOSE_TIMEOUT, closed).await;
-}
-
-/// Cuts `text` to at most `max` bytes without splitting a character.
-pub(crate) fn cut(text: &str, max: usize) -> &str {
-    let end = (0..=max.min(text.len()))
-        .rev()
-        .find(|&i| text.is_char_boundary(i))
-        .unwrap_or(0);
-    &text[..end]
 }
 
 /// The `bad_message` error for `e`.

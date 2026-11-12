@@ -206,7 +206,7 @@ impl TryFrom<RawError> for ErrorMessage {
 }
 
 /// Longest `message` in `error`, in characters (clause 18.4).
-const MAX_ERROR_CHARS: usize = 1024;
+pub(crate) const MAX_ERROR_CHARS: usize = 1024;
 
 /// A type descriptor (clause 15.4).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

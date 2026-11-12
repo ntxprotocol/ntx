@@ -242,10 +242,10 @@ fn publish_through_a_relay() {
     let (relay, relay_address) = relay(&["--pair", "1357"]);
     let url = format!("ws://{relay_address}/publish");
 
-    let mut unpaired = Running::start(&["publish", &url]);
+    // Without the relay's code, publish stops instead of retrying (clause 11.3).
+    let unpaired = Running::start(&["publish", &url]);
     unpaired.expect("relay error: pairing_required");
-    unpaired.line("not sent");
-    assert!(unpaired.finish().success());
+    assert!(!unpaired.finish().success());
 
     let mut publisher = Running::start(&[
         "publish",
