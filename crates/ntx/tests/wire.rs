@@ -149,6 +149,19 @@ fn source_closes_when_dropped() {
     assert_eq!(read_close(&mut ws), 1005);
 }
 
+/// Reads on a fake source until the close frame, and returns its code. Waits up to 20 seconds,
+/// longer than the spec's timeouts.
+fn fake_read_close(ws: &mut tungstenite::WebSocket<std::net::TcpStream>) -> u16 {
+    ws.get_ref()
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    loop {
+        if let WsMessage::Close(frame) = ws.read().unwrap() {
+            return frame.unwrap().code.into();
+        }
+    }
+}
+
 fn hello(ntx: &str) -> Value {
     json!({"op": "hello", "ntx": ntx, "source": {"id": "fake", "name": "FAKE"}, "channels": ["program"], "session": "s1"})
 }
@@ -251,15 +264,7 @@ fn receiver_pings_a_quiet_source_and_gives_up_on_a_silent_one() {
     let ping = read(&mut ws);
     assert_eq!(ping["op"], "ping");
     // Keep ignoring it: after 15 seconds the receiver closes with 4008 (clauses 11.2, 12.5).
-    ws.get_ref()
-        .set_read_timeout(Some(Duration::from_secs(15)))
-        .unwrap();
-    let close = loop {
-        if let WsMessage::Close(frame) = ws.read().unwrap() {
-            break frame.unwrap().code;
-        }
-    };
-    assert_eq!(u16::from(close), 4008);
+    assert_eq!(fake_read_close(&mut ws), 4008);
     let reason = wait_for(
         || r.wait_event(Duration::from_secs(20)),
         |e| match e {
@@ -432,12 +437,7 @@ fn errors_that_need_the_user_stop_reconnecting() {
     let r = Receiver::connect(&url, receiver_config(&["program"], None)).unwrap();
     let mut ws = accept(&listener);
     write(&mut ws, &greeting);
-    let close = loop {
-        if let WsMessage::Close(frame) = ws.read().unwrap() {
-            break frame.unwrap().code;
-        }
-    };
-    assert_eq!(u16::from(close), 4003);
+    assert_eq!(fake_read_close(&mut ws), 4003);
     assert_eq!(next_error(&r), ErrorCode::PairingRequired);
     assert!(!connects_within(&listener, Duration::from_millis(1500)));
 
@@ -514,14 +514,6 @@ fn a_receiver_closes_with_4008_without_hello() {
     let (listener, url) = fake_server("/");
     let r = one_shot_receiver(&url);
     let mut ws = accept(&listener);
-    ws.get_ref()
-        .set_read_timeout(Some(Duration::from_secs(15)))
-        .unwrap();
-    let close = loop {
-        if let WsMessage::Close(frame) = ws.read().unwrap() {
-            break frame.unwrap().code;
-        }
-    };
-    assert_eq!(u16::from(close), 4008);
+    assert_eq!(fake_read_close(&mut ws), 4008);
     assert!(disconnect_reason(&r).contains("no hello"));
 }
