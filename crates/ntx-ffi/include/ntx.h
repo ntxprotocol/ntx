@@ -75,6 +75,14 @@ void ntx_string_free(char *s);
 // Pointers must be null or valid: NUL-terminated UTF-8 strings, live handles (see `ntx.h`).
 char *ntx_render(const char *fields_json, const char *pattern);
 
+// `name` with this computer's name in front, e.g. `"CHURCH-PC (Lyrics)"`: the form of source
+// name the spec recommends (clause 8.2). Free the result with `ntx_string_free`; null on failure.
+//
+// # Safety
+//
+// `name` is null or a NUL-terminated UTF-8 string.
+char *ntx_display_name(const char *name);
+
 // Starts a source. `config_json` is an object with `name` and optionally `id`, `channels`,
 // `bind`, `port`, `path`, `pairing_code` and `advertise` (see `SourceConfig` in the Rust docs).
 // On success `*out` receives the handle; free it with [`ntx_source_free`].

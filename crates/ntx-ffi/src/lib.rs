@@ -380,6 +380,20 @@ pub unsafe extern "C" fn ntx_render(fields_json: *const c_char, pattern: *const 
     })
 }
 
+/// `name` with this computer's name in front, e.g. `"CHURCH-PC (Lyrics)"`: the form of source
+/// name the spec recommends (clause 8.2). Free the result with `ntx_string_free`; null on failure.
+///
+/// # Safety
+///
+/// `name` is null or a NUL-terminated UTF-8 string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ntx_display_name(name: *const c_char) -> *mut c_char {
+    call_string(|| {
+        // SAFETY: pointer rules are the caller's, as documented.
+        Ok(Some(ntx::display_name(unsafe { str_arg(name, "name") }?)))
+    })
+}
+
 // ---------------------------------------------------------------------------------------------
 // Source
 

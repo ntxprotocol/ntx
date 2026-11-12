@@ -17,6 +17,8 @@ All notable changes are listed here. The format follows
 - `ntx-ffi`: C ABI (opaque handles, JSON settings and events, polling), `ntx.h` header generated
   by cbindgen, and a C example that is compiled and run by the tests.
 - Events serialise to JSON (`{"event": ..., "data": ...}`).
+- `ntx_display_name` in the C ABI: a name with the computer's name in front (spec clause 8.2),
+  as `ntx::display_name` does in Rust, so every SDK can name sources the same way.
 - Publishing through a relay (spec clause 14): `Publisher` sends text through a relay, with
   pairing, tally events and reconnection; `Relay` serves each publisher to the network as a
   source, checks web page origins against an allow-list (`origin_requested` events,
@@ -37,6 +39,13 @@ All notable changes are listed here. The format follows
   frame.
 - `Receiver::reconnect` and `Publisher::reconnect` (C ABI: `ntx_receiver_reconnect`,
   `ntx_publisher_reconnect`): connect again now, also after an error that stopped reconnecting.
+
+### Fixed
+
+- Discovery never keeps a link-local IPv6 address (such as `fe80::1`) in a source's URL; it
+  falls back to the host name. Before, Preview could fail with "No route to host".
+- Dropping a `Source` or `Relay` waits (up to 1 second) until its connections have sent their
+  close frames, so a program that exits right away no longer resets them.
 
 ### Changed
 

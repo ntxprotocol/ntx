@@ -170,6 +170,16 @@ fn versions() {
 }
 
 #[test]
+fn display_names() {
+    let name = c("Lyrics");
+    // SAFETY: a valid string.
+    let shown = take_string(unsafe { ntx_display_name(name.as_ptr()) });
+    assert_eq!(shown, Some(ntx::display_name("Lyrics")));
+    // SAFETY: null is allowed and fails.
+    assert_eq!(take_string(unsafe { ntx_display_name(ptr::null()) }), None);
+}
+
+#[test]
 fn source_and_receiver_round_trip() {
     let source = start(&json!({
         "name": "C API (source)", "id": "c-api", "channels": ["program", "preview"],
