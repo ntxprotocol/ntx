@@ -84,12 +84,14 @@ fn pairing_proofs_missing_or_malformed() {
     // Clause 13.4: no `pairing` or no `proof` is pairing_required; a proof that is not
     // 44 characters of Base64 is pairing_failed, not bad_message.
     let s = source(Some("4321"));
+    // A null proof does not match the schema at all: bad_message (clause 7.3).
     let cases = [
-        (None, "pairing_required"),
-        (Some(json!({})), "pairing_required"),
-        (Some(json!({"proof": "not-base64"})), "pairing_failed"),
+        (None, "pairing_required", 4003),
+        (Some(json!({})), "pairing_required", 4003),
+        (Some(json!({"proof": "not-base64"})), "pairing_failed", 4003),
+        (Some(json!({"proof": null})), "bad_message", 4000),
     ];
-    for (pairing, code) in cases {
+    for (pairing, code, close) in cases {
         let mut ws = raw_connect(&format!("ws://{}/", s.local_addr()));
         let hello = read_json(&mut ws);
         assert_eq!(hello["pairing"]["nonce"].as_str().map(str::len), Some(32));
@@ -99,7 +101,7 @@ fn pairing_proofs_missing_or_malformed() {
         }
         send_json(&mut ws, &answer);
         assert_eq!(read_json(&mut ws)["code"], code);
-        assert_eq!(read_close(&mut ws), 4003);
+        assert_eq!(read_close(&mut ws), close);
     }
 }
 

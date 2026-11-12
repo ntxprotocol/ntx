@@ -11,6 +11,14 @@ use crate::{Error, MAX_MESSAGE_BYTES, PROGRAM, Result};
 /// The fields of an item: any JSON object.
 pub type Fields = Map<String, Value>;
 
+/// An optional member: it may be absent (`None`, with `#[serde(default)]`), but not `null`,
+/// which the schemas reject (clause 7.3).
+fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    d: D,
+) -> std::result::Result<Option<T>, D::Error> {
+    T::deserialize(d).map(Some)
+}
+
 /// Largest allowed sequence number (2^53 − 1, clause 9.4).
 pub const MAX_SEQ: u64 = (1 << 53) - 1;
 
@@ -36,7 +44,11 @@ pub struct PairingProof {
     /// Base64 of HMAC-SHA256(pairing code, nonce). Its format is checked with the proof itself,
     /// so a malformed proof is `pairing_failed` and a missing one `pairing_required`
     /// (clause 13.4).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub proof: Option<String>,
 }
 
@@ -52,7 +64,11 @@ pub struct Hello {
     /// Changes whenever the source restarts (clause 9.4).
     pub session: String,
     /// Present when pairing is required.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub pairing: Option<PairingChallenge>,
 }
 
@@ -64,10 +80,18 @@ pub struct Subscribe {
     /// Who the receiver is.
     pub receiver: Endpoint,
     /// Channels to receive; `program` when absent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub channels: Option<Vec<String>>,
     /// Pairing proof, when the source asked for one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub pairing: Option<PairingProof>,
 }
 
@@ -79,10 +103,18 @@ pub struct Publish {
     /// The source the relay will serve.
     pub source: Endpoint,
     /// The published channels; `program` when absent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub channels: Option<Vec<String>>,
     /// Pairing proof, when the relay asked for one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub pairing: Option<PairingProof>,
 }
 
@@ -130,7 +162,11 @@ pub struct ErrorMessage {
     /// What went wrong.
     pub code: ErrorCode,
     /// Optional text for logs.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub message: Option<String>,
 }
 
@@ -138,6 +174,7 @@ pub struct ErrorMessage {
 #[derive(Deserialize)]
 struct RawError {
     code: String,
+    #[serde(default, deserialize_with = "present")]
     message: Option<String>,
 }
 
@@ -178,10 +215,18 @@ pub struct TypeDescriptor {
     #[serde(rename = "ntxType")]
     pub ntx_type: String,
     /// Short name for people.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub title: Option<String>,
     /// Longer explanation for people.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub description: Option<String>,
     /// JSON Schema of the fields, limited to the allowed keywords.
     pub schema: Value,
@@ -513,7 +558,8 @@ fn check_field_schema(schema: &Value, at: &str) -> Result<()> {
             }
             "enum" | "examples" => value.is_array(),
             "default" => true,
-            "maxLength" => value.is_u64(),
+            // A JSON Schema integer may be written with a fraction of zero, as in `5.0`.
+            "maxLength" => value.as_f64().is_some_and(|n| n >= 0.0 && n.fract() == 0.0),
             _ => {
                 return Err(Error::InvalidMessage(format!(
                     "{at}: keyword {key:?} is not allowed in type descriptors"
@@ -639,5 +685,34 @@ mod tests {
         long.title = None;
         long.description = Some("d".repeat(4097));
         assert!(long.validate().is_err());
+    }
+
+    #[test]
+    fn null_is_not_an_absent_member() {
+        // Each case and its answer as the spec's JSON Schemas give it (ajv 8, spec d76e9ba).
+        let r = r#""receiver":{"id":"r","name":"R"}"#;
+        let p = r#""source":{"id":"p","name":"P"}"#;
+        let t = r#""ntxType":"com.example.t""#;
+        let cases = [
+            (r#"{"op":"error","code":"bad_message","message":null}"#.to_string(), false),
+            (r#"{"op":"error","code":"bad_message"}"#.to_string(), true),
+            (format!(r#"{{"op":"subscribe","ntx":"0.1",{r},"pairing":null}}"#), false),
+            (format!(r#"{{"op":"subscribe","ntx":"0.1",{r},"channels":null}}"#), false),
+            (format!(r#"{{"op":"subscribe","ntx":"0.1",{r},"pairing":{{"proof":null}}}}"#), false),
+            (format!(r#"{{"op":"subscribe","ntx":"0.1",{r},"pairing":{{}}}}"#), true),
+            (format!(r#"{{"op":"publish","ntx":"0.1",{p},"channels":null}}"#), false),
+            (format!(r#"{{"op":"publish","ntx":"0.1",{p},"pairing":null}}"#), false),
+            (
+                r#"{"op":"hello","ntx":"0.1","source":{"id":"s","name":"S"},"channels":["program"],"session":"x","pairing":null}"#.to_string(),
+                false,
+            ),
+            (format!(r#"{{"op":"announce","types":[{{{t},"title":null,"schema":{{"type":"object"}}}}]}}"#), false),
+            (format!(r#"{{"op":"announce","types":[{{{t},"description":null,"schema":{{"type":"object"}}}}]}}"#), false),
+            (format!(r#"{{"op":"announce","types":[{{{t},"schema":{{"type":"object","maxLength":5.0}}}}]}}"#), true),
+            (format!(r#"{{"op":"announce","types":[{{{t},"schema":{{"type":"object","maxLength":5.5}}}}]}}"#), false),
+        ];
+        for (text, valid) in cases {
+            assert_eq!(Message::parse(&text).is_ok(), valid, "{text}");
+        }
     }
 }
