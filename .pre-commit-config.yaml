@@ -87,6 +87,28 @@ repos:
         pass_filenames: false
         always_run: true
         stages: [pre-push]
+      # CI tests on Linux and Windows too; here, those platforms' code is at least linted.
+      - id: clippy-linux
+        name: cargo clippy for Linux (x86_64-unknown-linux-gnu)
+        language: system
+        entry: cargo clippy --workspace --all-targets --locked --target x86_64-unknown-linux-gnu -- -D warnings
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+      - id: clippy-windows
+        name: cargo clippy for Windows (x86_64-pc-windows-msvc)
+        language: system
+        entry: cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+      - id: msrv
+        name: builds with the oldest supported Rust (1.87)
+        language: system
+        entry: cargo +1.87 check --workspace --all-targets --locked
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
   - repo: local
     hooks:
       - id: no-duplicate-code
