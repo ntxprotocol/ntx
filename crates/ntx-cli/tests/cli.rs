@@ -343,3 +343,28 @@ fn relay_refuses_an_invalid_allowed_origin() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("invalid origin"));
 }
+
+#[test]
+fn send_closes_its_connections_before_it_exits() {
+    let (mut sender, address) = sender(&["--no-mdns"]);
+    let mut request =
+        tungstenite::client::IntoClientRequest::into_client_request(format!("ws://{address}/")).unwrap();
+    request
+        .headers_mut()
+        .insert("sec-websocket-protocol", "ntx".parse().unwrap());
+    let (mut ws, _) = tungstenite::connect(request).unwrap();
+    let subscribe = r#"{"op":"subscribe","ntx":"0.1","receiver":{"id":"surface","name":"surface test"}}"#;
+    ws.send(tungstenite::Message::text(subscribe)).unwrap();
+    sender.expect("+ receiver");
+    sender.line("last line");
+    sender.expect("sent seq 1");
+    assert!(sender.finish().success());
+    // The receiver gets a close frame, not a connection reset (RFC 6455 section 7).
+    loop {
+        match ws.read() {
+            Ok(tungstenite::Message::Close(_)) | Err(tungstenite::Error::ConnectionClosed) => break,
+            Ok(_) => {}
+            Err(e) => panic!("no close frame: {e}"),
+        }
+    }
+}

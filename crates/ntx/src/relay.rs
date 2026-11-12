@@ -110,7 +110,7 @@ pub struct Relay {
     shared: Arc<Shared>,
     events: Mutex<mpsc::Receiver<RelayEvent>>,
     local_addr: SocketAddr,
-    stop: watch::Sender<bool>,
+    _stop: wire::Stopper,
 }
 
 struct Shared {
@@ -187,7 +187,7 @@ impl Relay {
             shared,
             events: Mutex::new(events_rx),
             local_addr,
-            stop,
+            _stop: stop,
         })
     }
 
@@ -235,12 +235,6 @@ impl Relay {
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
-    }
-}
-
-impl Drop for Relay {
-    fn drop(&mut self) {
-        let _ = self.stop.send(true);
     }
 }
 

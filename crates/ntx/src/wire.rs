@@ -192,19 +192,38 @@ pub(crate) struct Incoming {
 
 /// Accepts connections on the background runtime, serving each one on its own task with
 /// `serve(incoming, shared, stop)`. Connections over the limits are closed at once, before the
-/// WebSocket upgrade. Stops when the returned sender sends `true`.
+/// WebSocket upgrade. Stops when the returned [`Stopper`] is dropped.
 pub(crate) fn serve_connections<T, Fut>(
     listener: TcpListener,
     shared: Arc<T>,
     serve: fn(Incoming, Arc<T>, watch::Receiver<bool>) -> Fut,
-) -> watch::Sender<bool>
+) -> Stopper
 where
     T: Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
     let (stop, stop_rx) = watch::channel(false);
     runtime().spawn(accept_loop(listener, shared, serve, stop_rx));
-    stop
+    Stopper(stop)
+}
+
+/// How long dropping a [`Stopper`] waits for its connections to close.
+const CLOSE_WAIT: Duration = Duration::from_secs(1);
+
+/// Stops accepting and serving connections when dropped. It tells each connection to close, then
+/// waits up to [`CLOSE_WAIT`] until all have sent their close frame, so that a program which
+/// exits right afterwards still closes them properly instead of resetting them.
+pub(crate) struct Stopper(watch::Sender<bool>);
+
+impl Drop for Stopper {
+    fn drop(&mut self) {
+        let _ = self.0.send(true);
+        // Each connection task and the accept loop hold a receiver until they are done.
+        let deadline = Instant::now() + CLOSE_WAIT;
+        while self.0.receiver_count() > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 }
 
 async fn accept_loop<T, Fut>(

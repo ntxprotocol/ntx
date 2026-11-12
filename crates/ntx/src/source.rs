@@ -81,7 +81,7 @@ pub struct Source {
     shared: Arc<Shared>,
     events: Mutex<mpsc::Receiver<SourceEvent>>,
     local_addr: SocketAddr,
-    stop: watch::Sender<bool>,
+    _stop: wire::Stopper,
     /// The mDNS daemon and the registered service name.
     mdns: Option<(Arc<Mdns>, String)>,
 }
@@ -161,7 +161,7 @@ impl Source {
             shared,
             events: Mutex::new(events_rx),
             local_addr,
-            stop,
+            _stop: stop,
             mdns,
         })
     }
@@ -242,7 +242,6 @@ impl Source {
 
 impl Drop for Source {
     fn drop(&mut self) {
-        let _ = self.stop.send(true);
         if let Some((daemon, fullname)) = self.mdns.take() {
             if let Ok(done) = daemon.0.unregister(&fullname) {
                 let _ = done.recv_timeout(Duration::from_secs(1));
