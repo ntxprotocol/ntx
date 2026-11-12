@@ -164,6 +164,7 @@ impl Relay {
             name: config.name,
         };
         check_endpoint(&identity)?;
+        crate::pairing::check_code(config.pairing_code.as_deref())?;
         let allowed = config
             .allowed_origins
             .iter()
@@ -329,10 +330,11 @@ async fn serve(incoming: Incoming, shared: Arc<Shared>, mut stop: watch::Receive
         address,
         slot,
     } = incoming;
-    let (mut peer, origin) = match wire::accept(stream, &shared.path, "publish").await {
-        Ok(accepted) => accepted,
-        Err(Ended(e)) => return tracing::debug!("upgrade from {address} failed: {e}"),
-    };
+    let (mut peer, origin) =
+        match wire::unless_stopped(&mut stop, wire::accept(stream, &shared.path, "publish")).await {
+            Ok(accepted) => accepted,
+            Err(Ended(e)) => return tracing::debug!("upgrade from {address} failed: {e}"),
+        };
     let admission = admit(origin.as_deref(), address.ip(), &shared.allowed.borrow());
     let origin = match admission {
         Admission::Allowed(origin) => origin,
@@ -364,7 +366,7 @@ async fn serve(incoming: Incoming, shared: Arc<Shared>, mut stop: watch::Receive
             _ => None,
         },
     );
-    let publish = match publish.await {
+    let publish = match wire::unless_stopped(&mut stop, publish).await {
         Ok(publish) => publish,
         Err(Ended(reason)) => return tracing::debug!("handshake with {address} failed: {reason}"),
     };

@@ -141,7 +141,12 @@ impl From<Ended> for Failed {
 async fn handshake(settings: &Settings) -> std::result::Result<(Connection, Hello), Failed> {
     let mut peer = tokio::time::timeout(HANDSHAKE_TIMEOUT, open(&settings.url))
         .await
-        .map_err(|_| Ended("no WebSocket upgrade".into()))??;
+        .map_err(|_| {
+            Ended(format!(
+                "timed out connecting to {} (no answer within 10 seconds)",
+                settings.url
+            ))
+        })??;
     let Ok(first) = tokio::time::timeout(HANDSHAKE_TIMEOUT, peer.recv()).await else {
         let reason = "no hello within 10 seconds";
         peer.close(Some((wire::TIMEOUT_CLOSE, reason))).await;
@@ -303,7 +308,7 @@ pub(crate) async fn keep_connected(
 }
 
 /// Waits until the owner asks for `at_least` (`Flush` also matches `Now`) or goes away.
-async fn until(stop: &mut watch::Receiver<Stop>, at_least: Stop) {
+pub(crate) async fn until(stop: &mut watch::Receiver<Stop>, at_least: Stop) {
     let _ = stop.wait_for(|s| *s == Stop::Now || *s == at_least).await;
 }
 

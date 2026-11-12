@@ -42,6 +42,23 @@ All notable changes are listed here. The format follows
 
 ### Fixed
 
+- From the review on 12 Nov 2026:
+  - Receivers ignore updates for channels they did not subscribe to (clause 8.3), so a
+    hostile source cannot grow their state without limit.
+  - `seq` accepts a zero fraction, as in `42.0`, like the schema does (clause 7.3).
+  - Invalid channel lists and an empty pairing code are refused when starting.
+  - Messages over the WebSocket limit get `too_large` (clause 18.1) instead of a reset.
+  - Dropping a `Receiver` closes its connection properly; so does a peer dropped for falling
+    behind (close code 1008).
+  - Wrong pairing codes from one address slow its answers down (3 seconds) but no longer lock
+    out the right code, so another program on the same computer cannot lock out a receiver.
+    Wrong codes are logged.
+  - At most 4 connections per address may be in their handshake, and the WebSocket upgrade
+    must finish within 3 seconds, so idle connections from a few addresses cannot take every
+    place. Stopping a source or relay no longer waits for connections still in their handshake.
+  - A failed connection says "timed out connecting to …" instead of "no WebSocket upgrade".
+  - `ntx send` and `ntx publish` report a line they cannot send and go on; Ctrl-C stops every
+    command cleanly.
 - Discovery never keeps a link-local IPv6 address (such as `fe80::1`) in a source's URL; it
   falls back to the host name. Before, Preview could fail with "No route to host".
 - Dropping a `Source` or `Relay` waits (up to 1 second) until its connections have sent their

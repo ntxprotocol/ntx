@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
+ctrlc = "3.5"
 ntx = { version = "0.1.0", path = "../ntx" }
 serde_json = "1.0.154"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

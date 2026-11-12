@@ -303,17 +303,36 @@ fn receiver_reports_a_refused_connection() {
 fn idle_connections_are_limited_and_time_out() {
     use std::io::Read;
     let s = source(None);
-    // Sockets that never send an upgrade request: one address may hold 16 places at most.
-    let mut idle: Vec<_> = (0..16)
+    // Receivers that finished their handshake do not count against the handshake limit.
+    let subscribed: Vec<_> = (0..4).map(|_| subscribed(&s)).collect();
+    // Sockets that never send an upgrade request: one address may hold 4 handshakes at most.
+    let mut idle: Vec<_> = (0..4)
         .map(|_| std::net::TcpStream::connect(s.local_addr()).unwrap())
         .collect();
     let one_too_many = tungstenite::connect(format!("ws://{}/", s.local_addr()));
     assert!(one_too_many.is_err(), "a connection over the limit was served");
-    // Without an upgrade within 10 seconds, the source closes them and frees their places.
-    idle[0].set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+    // Without an upgrade within 3 seconds, the source closes them and frees their places.
+    let started = std::time::Instant::now();
+    idle[0].set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     assert_eq!(idle[0].read(&mut [0; 16]).unwrap(), 0);
+    assert!(started.elapsed() < Duration::from_secs(5));
     let r = common::receiver(&s, &["program"], None);
     common::next_update(&r);
+    drop(subscribed);
+}
+
+#[test]
+fn stopping_does_not_wait_for_connections_in_their_handshake() {
+    let s = source(None);
+    let _idle = std::net::TcpStream::connect(s.local_addr()).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    let started = std::time::Instant::now();
+    drop(s);
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "{:?}",
+        started.elapsed()
+    );
 }
 
 #[test]
@@ -337,7 +356,7 @@ fn a_receiver_that_stops_reading_is_dropped() {
 }
 
 #[test]
-fn repeated_wrong_pairing_codes_lock_the_address_out() {
+fn repeated_wrong_pairing_codes_slow_down_but_never_lock_out_the_right_code() {
     let s = source(Some("1234"));
     let url = format!("ws://{}/", s.local_addr());
     let attempt = |code: &str| {
@@ -351,19 +370,20 @@ fn repeated_wrong_pairing_codes_lock_the_address_out() {
         send_json(&mut ws, &answer);
         read_json(&mut ws)
     };
-    // Guesses in parallel are counted too.
-    std::thread::scope(|scope| {
-        let guesses: Vec<_> = (0..10).map(|_| scope.spawn(|| attempt("0000"))).collect();
-        for guess in guesses {
-            assert_eq!(guess.join().unwrap()["code"], "pairing_failed");
-        }
-    });
-    let locked = attempt("1234");
-    assert_eq!(locked["code"], "pairing_failed");
-    assert!(
-        locked["message"].as_str().unwrap().contains("try again later"),
-        "{locked}"
-    );
+    // Guesses in parallel are counted too (at most 4 handshakes at once from one address).
+    for batch in [4, 4, 2] {
+        std::thread::scope(|scope| {
+            let guesses: Vec<_> = (0..batch).map(|_| scope.spawn(|| attempt("0000"))).collect();
+            for guess in guesses {
+                assert_eq!(guess.join().unwrap()["code"], "pairing_failed");
+            }
+        });
+    }
+    // After many failures, answers come later, but the right code still pairs: wrong guesses
+    // from another program on the same computer cannot lock out the real receiver.
+    let started = std::time::Instant::now();
+    assert_eq!(attempt("1234")["op"], "update");
+    assert!(started.elapsed() >= Duration::from_secs(3));
 }
 
 /// Whether a client connects to the fake server within `within`.
@@ -520,4 +540,39 @@ fn a_receiver_closes_with_4008_without_hello() {
     let mut ws = accept(&listener);
     assert_eq!(fake_read_close(&mut ws), 4008);
     assert!(disconnect_reason(&r).contains("no hello"));
+}
+
+#[test]
+fn receiver_closes_when_dropped() {
+    let (listener, url) = fake_server("/");
+    let r = one_shot_receiver(&url);
+    let mut ws = accept(&listener);
+    write(&mut ws, &hello("0.1"));
+    assert_eq!(read(&mut ws)["op"], "subscribe");
+    write(
+        &mut ws,
+        &json!({"op": "update", "channel": "program", "seq": 0, "type": "ntx.text", "fields": {}}),
+    );
+    assert!(matches!(
+        r.wait_event(WAIT),
+        Some(ReceiverEvent::Connected { .. })
+    ));
+    drop(r);
+    // A close frame, not a reset: the receiver closed before `drop` returned.
+    loop {
+        let message = ws.read().expect("a close frame, not a reset");
+        eprintln!("got {message:?}");
+        if let WsMessage::Close(_) = message {
+            break;
+        }
+    }
+}
+
+#[test]
+fn messages_over_the_websocket_limit_get_too_large() {
+    let s = source(None);
+    let mut ws = subscribed(&s);
+    // Far over the limit: the WebSocket layer refuses it before NTX parses it (clause 18.1).
+    ws.send(WsMessage::text("x".repeat(300_000))).unwrap();
+    assert_eq!(read_json(&mut ws)["code"], "too_large");
 }

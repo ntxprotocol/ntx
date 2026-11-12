@@ -179,10 +179,15 @@ fn raw_json_output_and_pairing() {
 
 #[test]
 fn bad_input_fails_cleanly() {
+    // A line that cannot be sent is reported and skipped: receivers keep their source.
     let (mut sender, _) = sender(&["--no-mdns", "--json"]);
     sender.line("not json");
-    let status = sender.finish();
-    assert!(!status.success());
+    sender.expect("not sent: ");
+    sender.line(&format!(r#"{{"text":"{}"}}"#, "x".repeat(70_000)));
+    sender.expect("not sent: message is");
+    sender.line(r#"{"text":"ok"}"#);
+    sender.expect("sent seq 1");
+    assert!(sender.finish().success());
 
     let bad_pattern = Command::new(NTX)
         .args(["recv", "127.0.0.1", "--pattern", "{oops"])
@@ -289,23 +294,48 @@ fn relay_refuses_web_pages_unless_allowed() {
     assert!(relay.finish().success());
 }
 
-#[test]
+/// Accepts one WebSocket connection on `listener` as a fake source or relay, and says `hello`.
 #[allow(clippy::result_large_err)] // the callback's error type comes from tungstenite
+fn accept_fake(listener: &std::net::TcpListener) -> tungstenite::WebSocket<std::net::TcpStream> {
+    let (stream, _) = listener.accept().unwrap();
+    let echo_ntx = |_: &tungstenite::handshake::server::Request,
+                    mut response: tungstenite::handshake::server::Response| {
+        let headers = response.headers_mut();
+        headers.insert("sec-websocket-protocol", "ntx".parse().unwrap());
+        Ok(response)
+    };
+    let mut ws = tungstenite::accept_hdr(stream, echo_ntx).unwrap();
+    let hello = r#"{"op":"hello","ntx":"0.1","source":{"id":"fake","name":"FAKE"},"channels":["program"],"session":"s"}"#;
+    ws.send(tungstenite::Message::text(hello)).unwrap();
+    ws
+}
+
+#[test]
+fn recv_closes_its_connection_before_it_exits() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let receiver = recv(&address, 1, &[]);
+    let mut ws = accept_fake(&listener);
+    let update = r#"{"op":"update","channel":"program","seq":1,"type":"ntx.text","fields":{"text":"hi"}}"#;
+    ws.send(tungstenite::Message::text(update)).unwrap();
+    assert!(receiver.join().unwrap().status.success());
+    // The source gets a close frame, not a connection reset (RFC 6455 section 7).
+    loop {
+        match ws.read() {
+            Ok(tungstenite::Message::Close(_)) | Err(tungstenite::Error::ConnectionClosed) => break,
+            Ok(_) => {}
+            Err(e) => panic!("no close frame: {e}"),
+        }
+    }
+}
+
+#[test]
 fn piped_input_reaches_the_relay_before_publish_exits() {
     // A fake relay that records what the publisher sends.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("ws://{}/publish", listener.local_addr().unwrap());
     let relay = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let echo_ntx = |_: &tungstenite::handshake::server::Request,
-                        mut response: tungstenite::handshake::server::Response| {
-            let headers = response.headers_mut();
-            headers.insert("sec-websocket-protocol", "ntx".parse().unwrap());
-            Ok(response)
-        };
-        let mut ws = tungstenite::accept_hdr(stream, echo_ntx).unwrap();
-        let hello = r#"{"op":"hello","ntx":"0.1","source":{"id":"fake","name":"FAKE"},"channels":["program"],"session":"s"}"#;
-        ws.send(tungstenite::Message::text(hello)).unwrap();
+        let mut ws = accept_fake(&listener);
         let mut seen = Vec::new();
         while let Ok(message) = ws.read() {
             if let tungstenite::Message::Text(text) = message {

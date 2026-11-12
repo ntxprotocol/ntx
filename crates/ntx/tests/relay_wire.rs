@@ -65,8 +65,15 @@ fn relay_hello_and_forwarding() {
     let update = json!({"op": "update", "channel": "program", "seq": 99, "type": "ntx.text", "fields": {"text": "hi"}});
     send_json(&mut ws, &update);
     let r = receiver_at(port, &["program"]);
-    let state = common::next_update(&r);
-    assert_eq!((state.seq, common::text(&state)), (1, "hi"));
+    // Under load the receiver may connect before the relay applied the update: then it gets the
+    // empty state first.
+    let state = loop {
+        let update = common::next_update(&r);
+        if common::text(&update) == "hi" {
+            break update;
+        }
+    };
+    assert_eq!(state.seq, 1);
 
     // Problems after the handshake are reported, not fatal.
     send_json(

@@ -4,6 +4,7 @@ use std::error::Error;
 use std::io::BufRead;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
@@ -14,6 +15,14 @@ use ntx::{
 };
 
 type CliResult = Result<(), Box<dyn Error>>;
+
+/// Set by Ctrl-C. Commands then stop like at the end of their input, so what runs is dropped
+/// normally and closes its connections properly instead of resetting them.
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+fn interrupted() -> bool {
+    INTERRUPTED.load(Ordering::Relaxed)
+}
 
 #[derive(Parser)]
 #[command(
@@ -171,6 +180,9 @@ fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .with_env_filter(filter)
         .init();
+    if let Err(e) = ctrlc::set_handler(|| INTERRUPTED.store(true, Ordering::Relaxed)) {
+        eprintln!("warning: Ctrl-C will not stop cleanly: {e}");
+    }
     let result = match Cli::parse().command {
         Command::Send(args) => send(&args),
         Command::Recv(args) => recv(&args),
@@ -279,7 +291,7 @@ fn relay(args: &RelayArgs) -> CliResult {
         |t| relay.wait_event(t),
         describe,
         || {
-            for line in std::io::stdin().lock().lines() {
+            for line in input_lines() {
                 line?;
             }
             Ok(())
@@ -337,21 +349,50 @@ macro_rules! lines {
 
 lines!(Source, Publisher);
 
-/// Sends each line of standard input with `sender`.
+/// Sends each line of standard input with `sender`. A line that cannot be sent, such as text
+/// over the size limit or invalid JSON, is reported and skipped: receivers keep their source.
 fn send_lines(args: &LineArgs, sender: &impl Lines) -> CliResult {
     eprintln!("type a line and press Enter to send it; an empty line clears; Ctrl-D quits");
-    for line in std::io::stdin().lock().lines() {
+    for line in input_lines() {
         let line = line?;
-        let seq = if line.is_empty() {
-            sender.clear(&args.channel)?
+        let sent: Result<u64, Box<dyn Error>> = if line.is_empty() {
+            sender.clear(&args.channel).map_err(Into::into)
         } else if args.json {
-            sender.update(&args.channel, &args.type_name, serde_json::from_str(&line)?)?
+            serde_json::from_str(&line)
+                .map_err(Into::into)
+                .and_then(|fields| Ok(sender.update(&args.channel, &args.type_name, fields)?))
         } else {
-            sender.update_text(&args.channel, &line)?
+            sender.update_text(&args.channel, &line).map_err(Into::into)
         };
-        eprintln!("sent seq {seq}");
+        match sent {
+            Ok(seq) => eprintln!("sent seq {seq}"),
+            Err(e) => eprintln!("not sent: {e}"),
+        }
     }
     Ok(())
+}
+
+/// The lines of standard input, until it ends or Ctrl-C is pressed.
+fn input_lines() -> impl Iterator<Item = std::io::Result<String>> {
+    let (lines, rx) = mpsc::channel();
+    // Reading blocks, so it runs on its own thread; the process exits without waiting for it.
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lock().lines() {
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    std::iter::from_fn(move || {
+        while !interrupted() {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(line) => return Some(line),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return None,
+            }
+        }
+        None
+    })
 }
 
 fn recv(args: &RecvArgs) -> CliResult {
@@ -368,8 +409,8 @@ fn recv(args: &RecvArgs) -> CliResult {
         });
     }
     let mut updates = 0;
-    while args.count.is_none_or(|count| updates < count) {
-        match receiver.wait_event(Duration::from_secs(1)) {
+    while args.count.is_none_or(|count| updates < count) && !interrupted() {
+        match receiver.wait_event(Duration::from_millis(100)) {
             Some(ReceiverEvent::Connected {
                 source,
                 session,

@@ -115,8 +115,8 @@ impl Source {
     ///
     /// # Errors
     ///
-    /// Fails if the id or name is empty or too long, the channels lack `program`, the port cannot
-    /// be opened, or mDNS cannot start.
+    /// Fails if the id or name is empty or too long, the channels are invalid or lack `program`,
+    /// the pairing code is empty, the port cannot be opened, or mDNS cannot start.
     pub fn start(config: SourceConfig) -> Result<Source> {
         Source::start_with(config, None)
     }
@@ -128,6 +128,7 @@ impl Source {
             name: config.name.clone(),
         };
         check_endpoint(&identity)?;
+        crate::pairing::check_code(config.pairing_code.as_deref())?;
         let store = Store::new(config.channels.clone())?;
         let (listener, local_addr) = wire::listen(config.bind, config.port)?;
         let mdns = if config.advertise {
@@ -327,10 +328,11 @@ async fn serve(incoming: Incoming, shared: Arc<Shared>, mut stop: watch::Receive
         address,
         slot,
     } = incoming;
-    let mut peer = match wire::accept(stream, &shared.path, "subscribe").await {
-        Ok((peer, _)) => peer,
-        Err(Ended(e)) => return tracing::debug!("upgrade from {address} failed: {e}"),
-    };
+    let mut peer =
+        match wire::unless_stopped(&mut stop, wire::accept(stream, &shared.path, "subscribe")).await {
+            Ok((peer, _)) => peer,
+            Err(Ended(e)) => return tracing::debug!("upgrade from {address} failed: {e}"),
+        };
     let hello = Hello {
         ntx: PROTOCOL_VERSION.to_string(),
         source: shared.identity.clone(),
@@ -348,7 +350,7 @@ async fn serve(incoming: Incoming, shared: Arc<Shared>, mut stop: watch::Receive
             _ => None,
         },
     );
-    let subscribe = match subscribe.await {
+    let subscribe = match wire::unless_stopped(&mut stop, subscribe).await {
         Ok(subscribe) => subscribe,
         Err(Ended(reason)) => return tracing::debug!("handshake with {address} failed: {reason}"),
     };

@@ -149,6 +149,9 @@ fn start_errors() {
         config.channels = channels.into_iter().map(String::from).collect();
         assert!(matches!(Source::start(config), Err(Error::InvalidMessage(_))));
     }
+    let mut config = SourceConfig::new("TEST");
+    config.pairing_code = Some(String::new());
+    assert!(matches!(Source::start(config), Err(Error::InvalidMessage(_))));
     let mut config = ReceiverConfig::new("TEST");
     config.channels = vec!["program".into(), "program".into()];
     assert!(matches!(

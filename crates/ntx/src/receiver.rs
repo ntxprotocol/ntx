@@ -157,6 +157,9 @@ impl Receiver {
 
 impl Drop for Receiver {
     fn drop(&mut self) {
+        // Close the connection properly before the program goes on, or exits.
+        let _ = self.stop.send(Stop::Flush);
+        wire::wait_until_unwatched(&self.stop);
         let _ = self.stop.send(Stop::Now);
     }
 }
@@ -206,7 +209,7 @@ impl Client for Link {
         &mut self,
         mut peer: Connection,
         hello: Hello,
-        _: watch::Receiver<Stop>,
+        mut stop: watch::Receiver<Stop>,
         progress: &mut Progress,
     ) -> Ended {
         self.seen.start_session(&hello.session);
@@ -228,6 +231,10 @@ impl Client for Link {
                     }
                 }
                 _ = tick.tick() => peer.heartbeat().await,
+                () = client::until(&mut stop, Stop::Flush) => {
+                    peer.close(None).await;
+                    Err(Ended("stopped".into()))
+                }
             };
             if let Err(ended) = outcome {
                 return ended;

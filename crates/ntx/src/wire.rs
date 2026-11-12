@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode};
@@ -35,6 +37,9 @@ const DEAD_AFTER: Duration = Duration::from_secs(15);
 
 /// Close code for a timeout (clause 12.5): no `subscribe` in time, or a silent peer.
 pub(crate) const TIMEOUT_CLOSE: u16 = 4008;
+
+/// WebSocket close code for a peer dropped by policy (RFC 6455, section 7.4.1).
+const POLICY_CLOSE: u16 = 1008;
 
 /// How long the first message of a handshake may take (clause 8.6).
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -115,16 +120,34 @@ const MAX_CONNECTIONS: usize = 64;
 /// per-origin limit, because every local publisher comes from the loopback address.
 const MAX_CONNECTIONS_PER_ADDRESS: usize = 16;
 
-/// Wrong pairing codes from one IP address before it is locked out (clause 13.4).
+/// Wrong pairing codes from one IP address before its answers are slowed down more (clause 13.4).
 const MAX_PAIRING_FAILURES: u32 = 10;
 
-/// How long a lockout lasts, and how long failures are remembered.
+/// How long failures are remembered.
 const PAIRING_LOCKOUT: Duration = Duration::from_secs(60);
+
+/// The extra wait before answering an address with too many recent failures.
+const SUSPECT_DELAY: Duration = Duration::from_secs(3);
+
+/// Most connections from one IP address that have not finished their handshake. Idle
+/// connections that never say `subscribe` or `publish` hold their place for up to 13 seconds, so
+/// this keeps a few addresses from taking every place (clause 20.2).
+const MAX_HANDSHAKES_PER_ADDRESS: usize = 4;
+
+/// How long the WebSocket upgrade may take.
+const UPGRADE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Connections from one IP address: all of them, and those still in their handshake.
+#[derive(Default)]
+struct Counts {
+    open: usize,
+    handshaking: usize,
+}
 
 /// The connections and pairing failures of one listening endpoint, per IP address.
 #[derive(Default)]
 struct Limits {
-    connections: Mutex<HashMap<IpAddr, usize>>,
+    connections: Mutex<HashMap<IpAddr, Counts>>,
     /// Failures and the time of the last one.
     pairing_failures: Mutex<HashMap<IpAddr, (u32, Instant)>>,
 }
@@ -133,22 +156,37 @@ struct Limits {
 pub(crate) struct Slot {
     limits: Arc<Limits>,
     ip: IpAddr,
+    handshaking: AtomicBool,
 }
 
 impl Slot {
     /// Takes a place for a connection from `ip`, if the limits allow it.
     fn take(limits: &Arc<Limits>, ip: IpAddr) -> Option<Slot> {
         let mut connections = lock(&limits.connections);
-        let total: usize = connections.values().sum();
+        let total: usize = connections.values().map(|c| c.open).sum();
         let from_ip = connections.entry(ip).or_default();
-        if total >= MAX_CONNECTIONS || *from_ip >= MAX_CONNECTIONS_PER_ADDRESS {
+        if total >= MAX_CONNECTIONS
+            || from_ip.open >= MAX_CONNECTIONS_PER_ADDRESS
+            || from_ip.handshaking >= MAX_HANDSHAKES_PER_ADDRESS
+        {
             return None;
         }
-        *from_ip += 1;
+        from_ip.open += 1;
+        from_ip.handshaking += 1;
         Some(Slot {
             limits: limits.clone(),
             ip,
+            handshaking: AtomicBool::new(true),
         })
+    }
+
+    /// Marks the handshake as done, freeing a handshake place for this address.
+    fn handshake_done(&self) {
+        if self.handshaking.swap(false, Ordering::Relaxed) {
+            if let Some(counts) = lock(&self.limits.connections).get_mut(&self.ip) {
+                counts.handshaking -= 1;
+            }
+        }
     }
 
     /// Whether this address made too many wrong pairing attempts recently.
@@ -173,10 +211,11 @@ impl Slot {
 
 impl Drop for Slot {
     fn drop(&mut self) {
+        self.handshake_done();
         let mut connections = lock(&self.limits.connections);
-        if let Some(count) = connections.get_mut(&self.ip) {
-            *count -= 1;
-            if *count == 0 {
+        if let Some(counts) = connections.get_mut(&self.ip) {
+            counts.open -= 1;
+            if counts.open == 0 {
                 connections.remove(&self.ip);
             }
         }
@@ -219,10 +258,16 @@ impl Drop for Stopper {
     fn drop(&mut self) {
         let _ = self.0.send(true);
         // Each connection task and the accept loop hold a receiver until they are done.
-        let deadline = Instant::now() + CLOSE_WAIT;
-        while self.0.receiver_count() > 0 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        wait_until_unwatched(&self.0);
+    }
+}
+
+/// Waits up to [`CLOSE_WAIT`] until nothing watches `signal` any more: the tasks it told to stop
+/// have finished, closing their connections.
+pub(crate) fn wait_until_unwatched<T>(signal: &watch::Sender<T>) {
+    let deadline = Instant::now() + CLOSE_WAIT;
+    while signal.receiver_count() > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -257,6 +302,18 @@ async fn accept_loop<T, Fut>(
     }
 }
 
+/// Runs one step of an incoming connection's handshake, giving up when the endpoint stops, so
+/// stopping waits for no one and starts nothing new.
+pub(crate) async fn unless_stopped<T>(
+    stop: &mut watch::Receiver<bool>,
+    work: impl Future<Output = Result<T, Ended>>,
+) -> Result<T, Ended> {
+    tokio::select! {
+        result = work => result,
+        _ = stop.changed() => Err(Ended("stopping".into())),
+    }
+}
+
 /// Accepts a WebSocket upgrade on `path` only. Returns the connection, expecting `handshake` as
 /// its first message, and the HTTP `Origin` header if there is one (clause 14.5).
 #[allow(clippy::result_large_err)] // the upgrade callback's error type comes from tungstenite
@@ -278,7 +335,7 @@ pub(crate) async fn accept(
         },
         Some(ws_config()),
     );
-    let ws = tokio::time::timeout(HANDSHAKE_TIMEOUT, upgrade)
+    let ws = tokio::time::timeout(UPGRADE_TIMEOUT, upgrade)
         .await
         .map_err(|_| Ended("no WebSocket upgrade".into()))?
         .map_err(|e| Ended(e.to_string()))?;
@@ -333,9 +390,13 @@ pub(crate) async fn pump<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let mut tick = tokio::time::interval(HEARTBEAT_INTERVAL);
     loop {
         let outcome = tokio::select! {
-            frame = out.recv() => match frame {
-                Some(frame) => peer.send_frame(frame).await,
-                None => Err(Ended("closed".into())),
+            frame = out.recv() => if let Some(frame) = frame {
+                peer.send_frame(frame).await
+            } else {
+                // The queue was let go: this peer fell too far behind (see `enqueue`).
+                let reason = "fell too far behind; reconnect for the full state";
+                peer.close(Some((POLICY_CLOSE, reason))).await;
+                Err(Ended(reason.into()))
             },
             message = peer.recv() => message.map(&mut handle),
             _ = tick.tick() => peer.heartbeat().await,
@@ -446,6 +507,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Peer<S> {
             let stream = self.stream.as_mut().expect("present until dropped");
             let frame = match stream.next().await {
                 Some(Ok(frame)) => frame,
+                // Over the WebSocket limit, the message is not read at all; still answer
+                // `too_large` (clause 18.1) rather than just dropping the connection.
+                Some(Err(WsError::Capacity(e))) => {
+                    return Err(self.reject(ErrorCode::TooLarge, e.to_string()).await);
+                }
                 Some(Err(e)) => return Err(Ended(e.to_string())),
                 None => return Err(Ended("connection closed".into())),
             };
@@ -569,6 +635,7 @@ pub(crate) async fn greet<T>(
             return Err(peer.reject(code, reason).await);
         }
         peer.handshake_done();
+        slot.handshake_done();
         Ok(answer)
     };
     if let Ok(greeted) = tokio::time::timeout(HANDSHAKE_TIMEOUT, greeting).await {
@@ -582,7 +649,8 @@ pub(crate) async fn greet<T>(
 /// Checks the version and pairing proof of a `subscribe` or `publish` (clauses 13.4, 19.3).
 /// `pairing` holds the pairing code and the nonce sent in `hello`, when pairing is required.
 /// Guessing is slowed down (clause 13.4): each failure waits a second, and an address with too
-/// many recent failures is locked out for a while, however many connections it opens.
+/// many recent failures waits longer for every answer. A correct proof still pairs, so wrong
+/// guesses from one program (or a web page) on a computer cannot lock out the real receiver.
 async fn check_answer(
     ntx: &str,
     pairing: Option<(&str, &str)>,
@@ -594,16 +662,15 @@ async fn check_answer(
         let Some(proof) = proof.and_then(|p| p.proof.as_deref()) else {
             return Err((ErrorCode::PairingRequired, "a pairing code is needed".into()));
         };
-        let locked_out = slot.locked_out();
-        if locked_out || !pairing::verify(code, nonce, proof) {
+        let suspect = slot.locked_out();
+        if suspect {
+            tokio::time::sleep(SUSPECT_DELAY).await;
+        }
+        if !pairing::verify(code, nonce, proof) {
             slot.pairing_failed();
+            tracing::warn!("wrong pairing code from {}", slot.ip);
             tokio::time::sleep(Duration::from_secs(1)).await;
-            let reason = if locked_out {
-                "too many wrong pairing codes; try again later"
-            } else {
-                "wrong pairing code"
-            };
-            return Err((ErrorCode::PairingFailed, reason.into()));
+            return Err((ErrorCode::PairingFailed, "wrong pairing code".into()));
         }
         slot.paired();
     }

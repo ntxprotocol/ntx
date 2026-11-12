@@ -8,6 +8,16 @@ use unicode_normalization::UnicodeNormalization;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// An empty code would pair everyone who also sends an empty one: refuse it (clause 13.1).
+pub(crate) fn check_code(code: Option<&str>) -> crate::Result<()> {
+    if code.is_some_and(str::is_empty) {
+        return Err(crate::Error::InvalidMessage(
+            "the pairing code is empty; leave it out to need none".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Creates a new random nonce for a `hello` message (32 hex characters).
 #[must_use]
 pub fn new_nonce() -> String {
