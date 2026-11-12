@@ -1,5 +1,6 @@
-use std::collections::HashMap;
-use std::sync::{Mutex, mpsc};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
 use tokio::sync::watch;
@@ -82,7 +83,7 @@ pub enum ReceiverEvent {
 
 /// An NTX receiver: connects to one source and keeps receiving its text.
 pub struct Receiver {
-    events: Mutex<mpsc::Receiver<ReceiverEvent>>,
+    events: Arc<Events>,
     tally: watch::Sender<Option<Tally>>,
     stop: watch::Sender<Stop>,
     retry: watch::Sender<()>,
@@ -98,7 +99,7 @@ impl Receiver {
     /// Fails if `address` is not a valid address.
     pub fn connect(address: &str, config: ReceiverConfig) -> Result<Receiver> {
         let url = client::normalize_url(address, "/")?;
-        let (events_tx, events_rx) = mpsc::channel();
+        let events = Arc::new(Events::default());
         let (tally, tally_rx) = watch::channel(None);
         let (stop, stop_rx) = watch::channel(Stop::Run);
         let (retry, retry_rx) = watch::channel(());
@@ -113,13 +114,13 @@ impl Receiver {
         )?;
         let link = Link {
             settings,
-            events: events_tx,
+            events: events.clone(),
             tally: tally_rx,
             seen: Seen::default(),
         };
         runtime().spawn(client::keep_connected(link, stop_rx, retry_rx));
         Ok(Receiver {
-            events: Mutex::new(events_rx),
+            events,
             tally,
             stop,
             retry,
@@ -139,13 +140,21 @@ impl Receiver {
     }
 
     /// Takes the next event, if any.
+    #[must_use]
     pub fn poll_event(&self) -> Option<ReceiverEvent> {
-        lock(&self.events).try_recv().ok()
+        lock(&self.events.queue).pop_front()
     }
 
     /// Waits up to `timeout` for the next event.
+    #[must_use]
     pub fn wait_event(&self, timeout: Duration) -> Option<ReceiverEvent> {
-        lock(&self.events).recv_timeout(timeout).ok()
+        let queue = lock(&self.events.queue);
+        let (mut queue, _) = self
+            .events
+            .ready
+            .wait_timeout_while(queue, timeout, |queue| queue.is_empty())
+            .unwrap_or_else(PoisonError::into_inner);
+        queue.pop_front()
     }
 
     /// The WebSocket URL this receiver connects to.
@@ -157,6 +166,7 @@ impl Receiver {
 
 impl Drop for Receiver {
     fn drop(&mut self) {
+        self.events.closed.store(true, Ordering::Relaxed);
         // Close the connection properly before the program goes on, or exits.
         let _ = self.stop.send(Stop::Flush);
         wire::wait_until_unwatched(&self.stop);
@@ -164,10 +174,48 @@ impl Drop for Receiver {
     }
 }
 
+/// Most events waiting for the app before new updates replace waiting ones.
+const MAX_WAITING: usize = 1024;
+
+/// Events waiting for the app. Once [`MAX_WAITING`] wait, an update replaces the waiting update
+/// of its channel, and an announcement the waiting announcement: state is latest-wins, so an app
+/// that falls behind skips what it would overwrite anyway, and a source that floods updates
+/// cannot grow memory without limit.
+#[derive(Default)]
+struct Events {
+    queue: Mutex<VecDeque<ReceiverEvent>>,
+    ready: Condvar,
+    /// Set when the [`Receiver`] is dropped.
+    closed: AtomicBool,
+}
+
+impl Events {
+    /// Queues `event`. Returns `false` once the receiver is dropped.
+    fn push(&self, event: ReceiverEvent) -> bool {
+        if self.closed.load(Ordering::Relaxed) {
+            return false;
+        }
+        let mut queue = lock(&self.queue);
+        if queue.len() >= MAX_WAITING {
+            let replaces = |waiting: &ReceiverEvent| match (waiting, &event) {
+                (ReceiverEvent::Update(old), ReceiverEvent::Update(new)) => old.channel == new.channel,
+                (ReceiverEvent::Announce(_), ReceiverEvent::Announce(_)) => true,
+                _ => false,
+            };
+            if let Some(older) = queue.iter().rposition(replaces) {
+                queue.remove(older);
+            }
+        }
+        queue.push_back(event);
+        self.ready.notify_one();
+        true
+    }
+}
+
 /// The background task behind a [`Receiver`].
 struct Link {
     settings: Settings,
-    events: mpsc::Sender<ReceiverEvent>,
+    events: Arc<Events>,
     tally: watch::Receiver<Option<Tally>>,
     seen: Seen,
 }
@@ -243,14 +291,14 @@ impl Client for Link {
     }
 
     fn error(&mut self, error: ErrorMessage) {
-        let _ = self.events.send(ReceiverEvent::Error {
+        self.events.push(ReceiverEvent::Error {
             code: error.code,
             message: error.message,
         });
     }
 
     fn disconnected(&mut self, reason: String) -> bool {
-        self.events.send(ReceiverEvent::Disconnected { reason }).is_ok()
+        self.events.push(ReceiverEvent::Disconnected { reason })
     }
 }
 
@@ -300,7 +348,7 @@ impl Link {
     }
 
     fn send(&self, event: ReceiverEvent) {
-        let _ = self.events.send(event);
+        self.events.push(event);
     }
 }
 
@@ -308,14 +356,45 @@ impl Link {
 mod tests {
     use super::*;
 
-    #[test]
-    fn sequence_numbers() {
-        let update = |channel: &str, seq| Update {
+    fn update(channel: &str, seq: u64) -> Update {
+        Update {
             channel: channel.into(),
             seq,
             type_name: "ntx.text".into(),
             fields: crate::Fields::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn an_app_that_falls_behind_gets_the_latest_state_and_bounded_memory() {
+        let events = Events::default();
+        events.push(ReceiverEvent::Disconnected {
+            reason: "first".into(),
+        });
+        for seq in 0..3 * MAX_WAITING as u64 {
+            events.push(ReceiverEvent::Update(update("program", seq)));
+            events.push(ReceiverEvent::Announce(Vec::new()));
+        }
+        assert!(events.push(ReceiverEvent::Update(update("preview", 1))));
+        let queue = lock(&events.queue);
+        assert!(queue.len() <= MAX_WAITING + 1, "{}", queue.len());
+        // Nothing but superseded updates and announcements is dropped, and order is kept.
+        assert!(matches!(&queue[0], ReceiverEvent::Disconnected { .. }));
+        let last_program = queue.iter().rev().find_map(|e| match e {
+            ReceiverEvent::Update(u) if u.channel == "program" => Some(u.seq),
+            _ => None,
+        });
+        assert_eq!(last_program, Some(3 * MAX_WAITING as u64 - 1));
+        assert!(matches!(queue.back(), Some(ReceiverEvent::Update(u)) if u.channel == "preview"));
+        drop(queue);
+        events.closed.store(true, Ordering::Relaxed);
+        assert!(!events.push(ReceiverEvent::Disconnected {
+            reason: "late".into()
+        }));
+    }
+
+    #[test]
+    fn sequence_numbers() {
         let mut seen = Seen::default();
         seen.start_session("a");
         assert!(seen.is_new(&update("program", 0)));

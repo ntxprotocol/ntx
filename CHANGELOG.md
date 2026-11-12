@@ -45,7 +45,17 @@ All notable changes are listed here. The format follows
   `NTX_ERR_INVALID_ORIGIN` (-9), `NTX_ERR_INVALID_PATTERN` (-10) and `NTX_ERR_INVALID_MESSAGE`
   (-11). Before, all of them were `NTX_ERR_FAILED` (-2), which now means an internal error only.
 
+### Added
+
+- `Pattern::fields()`: the field paths a pattern uses, so apps can warn about a path a type does
+  not have.
+
 ### Changed
+
+- A `Receiver` holds at most 1,024 waiting events before a new update replaces the waiting
+  update of its channel (and an announcement the waiting announcement). An app that falls far
+  behind skips what it would overwrite anyway, and a flooding source cannot grow its memory
+  without limit.
 
 Following the spec's review proposals (spec PR #10, issues #7–#9):
 

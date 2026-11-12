@@ -138,6 +138,15 @@ impl Pattern {
             })
             .collect()
     }
+
+    /// The field paths the pattern uses, in order, e.g. `["reference", "version"]`. Apps can warn
+    /// about a path that a type does not have, which would always render empty.
+    pub fn fields(&self) -> impl Iterator<Item = &str> {
+        self.parts.iter().filter_map(|p| match p {
+            Part::Field(path) => Some(path.as_str()),
+            Part::Text(_) => None,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -203,6 +212,7 @@ mod tests {
     fn patterns() {
         let f = fields();
         let p = Pattern::parse("{reference} · {version}").unwrap();
+        assert_eq!(p.fields().collect::<Vec<_>>(), ["reference", "version"]);
         assert_eq!(p.render(&f), "John 3:16 · KJV");
         assert_eq!(
             Pattern::parse("{{literal}} {version}").unwrap().render(&f),
