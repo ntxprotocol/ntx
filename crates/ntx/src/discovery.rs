@@ -115,19 +115,10 @@ impl Browser {
                 if let Some(p) = previous.filter(|p| p.port == info.port) {
                     addresses.extend(p.addresses.iter().copied());
                 }
-                // Prefer addresses other computers can reach: IPv4 first, loopback last.
-                addresses.sort_by_key(|a| (a.is_loopback(), a.is_ipv6(), is_link_local_v6(a), *a));
-                addresses.dedup();
-                // Keep the address already reported while it is still valid, so the URL stays stable.
-                let kept = previous
-                    .and_then(|p| p.addresses.first().copied())
-                    .filter(|a| addresses.contains(a) && !a.is_loopback());
-                if let Some(k) = kept {
-                    // The chosen address goes first, so `addresses[0]` is always the one in `url`.
-                    addresses.retain(|a| *a != k);
-                    addresses.insert(0, k);
-                }
-                let host = match addresses.first() {
+                let addresses = order_addresses(addresses, previous.and_then(|p| p.addresses.first()));
+                // A link-local address cannot go in a URL without its interface, so then use the
+                // host name.
+                let host = match addresses.first().filter(|a| !is_link_local_v6(a)) {
                     Some(IpAddr::V4(a)) => a.to_string(),
                     Some(IpAddr::V6(a)) => format!("[{a}]"),
                     None => info.host.trim_end_matches('.').to_string(),
@@ -182,6 +173,21 @@ impl Drop for Browser {
     }
 }
 
+/// Orders addresses best first: those other computers can reach (IPv4, then IPv6), then
+/// link-local, then loopback. The address reported before stays first while it is still known
+/// and as good as the best, so the URL does not change for nothing.
+fn order_addresses(mut addresses: Vec<IpAddr>, reported: Option<&IpAddr>) -> Vec<IpAddr> {
+    let rank = |a: &IpAddr| (a.is_loopback(), is_link_local_v6(a), a.is_ipv6());
+    addresses.sort_by_key(|a| (rank(a), *a));
+    addresses.dedup();
+    if let Some(&kept) = reported.filter(|r| addresses.first().is_some_and(|best| rank(r) == rank(best))) {
+        if let Some(i) = addresses.iter().position(|a| *a == kept) {
+            addresses[..=i].rotate_right(1);
+        }
+    }
+    addresses
+}
+
 /// IPv6 link-local addresses (`fe80::/10`) need an interface scope to be usable in a URL.
 fn is_link_local_v6(address: &IpAddr) -> bool {
     matches!(address, IpAddr::V6(v6) if v6.segments()[0] & 0xffc0 == 0xfe80)
@@ -193,4 +199,34 @@ fn instance_name(fullname: &str) -> String {
         .unwrap_or(fullname)
         .replace("\\.", ".")
         .replace("\\\\", "\\")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ips(list: &[&str]) -> Vec<IpAddr> {
+        list.iter().map(|a| a.parse().unwrap()).collect()
+    }
+
+    #[test]
+    fn reachable_addresses_come_first() {
+        let found = ips(&["::1", "fe80::1", "2001:db8::5", "127.0.0.1", "192.0.2.7"]);
+        let expected = ips(&["192.0.2.7", "2001:db8::5", "fe80::1", "127.0.0.1", "::1"]);
+        assert_eq!(order_addresses(found, None), expected);
+    }
+
+    #[test]
+    fn the_reported_address_stays_only_while_it_is_as_good() {
+        let reported: IpAddr = "192.0.2.9".parse().unwrap();
+        let found = ips(&["192.0.2.7", "192.0.2.9", "fe80::1"]);
+        assert_eq!(order_addresses(found, Some(&reported))[0], reported);
+        // Reported first, a link-local address gives way once an IPv4 address is known.
+        let link_local: IpAddr = "fe80::1".parse().unwrap();
+        let found = ips(&["fe80::1", "192.0.2.7"]);
+        assert_eq!(
+            order_addresses(found, Some(&link_local))[0],
+            ips(&["192.0.2.7"])[0]
+        );
+    }
 }
