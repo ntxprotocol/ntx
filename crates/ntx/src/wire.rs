@@ -607,7 +607,8 @@ fn is_other_version(text: &str, op: &str) -> bool {
         v.get("op").and_then(Value::as_str) == Some(op)
             && v.get("ntx")
                 .and_then(Value::as_str)
-                .is_some_and(|n| n != PROTOCOL_VERSION)
+                // A malformed version is a bad message, not another version (clause 19.1).
+                .is_some_and(|n| n != PROTOCOL_VERSION && crate::protocol::is_version(n))
     })
 }
 

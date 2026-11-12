@@ -56,6 +56,8 @@ Following the spec's review proposals (spec PR #10, issues #7–#9):
 - Clause 14.4: a relay refuses a publisher that publishes a source id already published from
   another origin, instead of replacing it.
 - Clause 16.2: array indexes have no leading zeros: `verses.01.text` finds nothing.
+- Clause 19.1: a malformed version such as `00.1` is answered with `bad_message`, not
+  `unsupported_version`.
 
 ### Fixed
 

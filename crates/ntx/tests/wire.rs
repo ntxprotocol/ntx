@@ -69,6 +69,8 @@ fn handshake_errors_close_with_the_right_codes() {
             4001,
         ),
         (json!({"op": "subscribe"}), "bad_message", 4000),
+        // A malformed version is not another version (clause 19.1).
+        (subscribe("00.1"), "bad_message", 4000),
     ];
     for (message, code, close) in cases {
         let mut ws = raw_connect(&format!("ws://{}/", s.local_addr()));
