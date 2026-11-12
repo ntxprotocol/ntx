@@ -183,7 +183,8 @@ fn display_names() {
 fn source_and_receiver_round_trip() {
     let source = start(&json!({
         "name": "C API (source)", "id": "c-api", "channels": ["program", "preview"],
-        "bind": "127.0.0.1", "port": 0, "path": "/", "advertise": false
+        "bind": "127.0.0.1", "port": 0, "path": "/", "advertise": false,
+        "allowed_origins": ["https://example.com"]
     }));
     let info = source_info(source);
     assert_eq!(

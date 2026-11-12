@@ -6,8 +6,8 @@ mod common;
 use std::time::Duration;
 
 use common::{
-    Raw, WAIT, accept, fake_server, raw_connect, read, read_close, read_json, receiver_config, send_json,
-    source, wait_for, write,
+    Raw, WAIT, accept, fake_server, raw_connect, raw_connect_from, read, read_close, read_json,
+    receiver_config, send_json, source, wait_for, write,
 };
 use ntx::protocol::ErrorCode;
 use ntx::{Receiver, ReceiverEvent, SourceEvent};
@@ -577,4 +577,38 @@ fn messages_over_the_websocket_limit_get_too_large() {
     // Far over the limit: the WebSocket layer refuses it before NTX parses it (clause 18.1).
     ws.send(WsMessage::text("x".repeat(300_000))).unwrap();
     assert_eq!(read_json(&mut ws)["code"], "too_large");
+}
+
+#[test]
+fn web_pages_from_the_internet_need_permission_to_read_a_source() {
+    let s = source(None);
+    let url = format!("ws://{}/", s.local_addr());
+    // A page on the internet is refused before hello (clause 8.7).
+    let mut evil = raw_connect_from(&url, Some("https://evil.example"));
+    assert_eq!(read_json(&mut evil)["code"], "not_allowed");
+    assert_eq!(read_close(&mut evil), 4003);
+    // Local pages, local files and programs are not.
+    for origin in [Some("http://localhost:8000"), Some("null"), None] {
+        let mut ws = raw_connect_from(&url, origin);
+        assert_eq!(read_json(&mut ws)["op"], "hello", "{origin:?}");
+    }
+    // Pairing checks every receiver, so a paired source greets every page.
+    let paired = source(Some("1234"));
+    let mut ws = raw_connect_from(
+        &format!("ws://{}/", paired.local_addr()),
+        Some("https://evil.example"),
+    );
+    assert_eq!(read_json(&mut ws)["op"], "hello");
+    // An allowed origin may read.
+    let mut config = ntx::SourceConfig::new("TEST (allowing)");
+    config.bind = [127, 0, 0, 1].into();
+    config.port = 0;
+    config.advertise = false;
+    config.allowed_origins = vec!["https://Evil.example/".into()];
+    let allowing = ntx::Source::start(config).unwrap();
+    let mut ws = raw_connect_from(
+        &format!("ws://{}/", allowing.local_addr()),
+        Some("https://evil.example"),
+    );
+    assert_eq!(read_json(&mut ws)["op"], "hello");
 }

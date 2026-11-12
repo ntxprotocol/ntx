@@ -384,3 +384,19 @@ fn a_publishers_wait_goes_back_to_one_second_after_a_long_connection() {
     let (_ws, third) = next(std::time::Instant::now());
     assert!(third < Duration::from_millis(1800), "{third:?}");
 }
+
+#[test]
+fn another_origin_cannot_take_over_a_published_source() {
+    let relay = relay(None, &["https://a.example", "https://b.example"]);
+    let (_a, port) = published(&relay, Some("https://a.example"));
+    // Source ids are public (mDNS, hello): b.example publishes a.example's id (clause 14.4).
+    let mut b = raw_connect_from(&url(&relay), Some("https://b.example"));
+    read_json(&mut b);
+    let mut message = publish("0.1");
+    message["source"]["id"] = "https://a.example".into();
+    send_json(&mut b, &message);
+    assert_eq!(read_json(&mut b)["code"], "not_allowed");
+    // a.example is still served, on the same port.
+    let r = receiver_at(port, &["program"]);
+    assert_eq!(common::next_update(&r).seq, 0);
+}

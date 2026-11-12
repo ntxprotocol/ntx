@@ -69,6 +69,10 @@ struct SendArgs {
     /// Require this pairing code.
     #[arg(long)]
     pair: Option<String>,
+    /// Let web pages from this origin read the source, e.g. `https://example.com`. Pages on this
+    /// computer or the local network may always. Repeat for more.
+    #[arg(long = "allow-origin")]
+    allowed_origins: Vec<String>,
     /// Do not advertise with mDNS.
     #[arg(long)]
     no_mdns: bool,
@@ -204,6 +208,7 @@ fn send(args: &SendArgs) -> CliResult {
     }
     config.port = args.port;
     config.pairing_code.clone_from(&args.pair);
+    config.allowed_origins.clone_from(&args.allowed_origins);
     config.advertise = !args.no_mdns;
     config.channels = args.lines.channels();
     let source = Source::start(config)?;

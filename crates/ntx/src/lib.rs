@@ -22,6 +22,7 @@ pub mod binding;
 mod client;
 mod discovery;
 mod error;
+mod origin;
 pub mod pairing;
 pub mod protocol;
 mod publisher;

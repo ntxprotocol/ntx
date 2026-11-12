@@ -45,6 +45,18 @@ All notable changes are listed here. The format follows
   `NTX_ERR_INVALID_ORIGIN` (-9), `NTX_ERR_INVALID_PATTERN` (-10) and `NTX_ERR_INVALID_MESSAGE`
   (-11). Before, all of them were `NTX_ERR_FAILED` (-2), which now means an internal error only.
 
+### Changed
+
+Following the spec's review proposals (spec PR #10, issues #7–#9):
+
+- Clause 8.7: a source refuses web pages from internet origins with `not_allowed`, unless
+  `SourceConfig::allowed_origins` lists them or the source requires pairing. Programs, local files
+  (`null`) and pages on this computer or the local network are accepted as before. Also in the C
+  ABI (`allowed_origins`) and the CLI (`ntx send --allow-origin`).
+- Clause 14.4: a relay refuses a publisher that publishes a source id already published from
+  another origin, instead of replacing it.
+- Clause 16.2: array indexes have no leading zeros: `verses.01.text` finds nothing.
+
 ### Fixed
 
 - From the review on 12 Nov 2026:
