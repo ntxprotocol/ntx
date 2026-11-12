@@ -32,6 +32,19 @@ sending text, not video, between apps on a local network.
 The language SDKs live in their own repositories and use this core: `ntx-python`, `ntx-node`,
 `ntx-dotnet`, `ntx-java` and `ntx-web` (TypeScript for browsers). They are not public yet.
 
+## Words used here
+
+| Word | Meaning |
+| --- | --- |
+| **Source** | An app that sends text, e.g. lyrics or presentation software |
+| **Receiver** | An app that shows a source's text, e.g. OBS, vMix or a stage display |
+| **Channel** | A source's text stream: **program** is what is live, **preview** is what comes next |
+| **Tally** | A receiver telling the source it is showing it: red when on air (program), green in preview |
+| **Relay** | A program that takes text from publishers and serves it to the network as ordinary sources |
+| **Publisher** | An app that cannot accept connections, such as a web page, sending its text through a relay |
+| **Origin** | The web address a page comes from, e.g. `https://example.com`; a relay accepts only allowed ones |
+| **mDNS** | Multicast DNS: how sources announce themselves on the local network, so `list` finds them |
+
 ## Try it
 
 You need [Rust](https://rustup.rs) 1.87 or newer and [Git](https://git-scm.com). Get the code:
@@ -75,7 +88,7 @@ Useful options (`--help` on each command lists them all):
 | `publish` | `--name`, `--pair`, `--preview`, `--json --type …`, `--channel` |
 
 Programs that cannot accept connections, such as web pages, publish through a relay
-([spec clause 14](https://github.com/ntxprotocol/spec)). Run a relay, then publish to it; the relay
+([spec clause 14](https://github.com/ntxprotocol/spec/blob/main/ntx.md#14-publishing-through-a-relay)). Run a relay, then publish to it; the relay
 serves the text to the network as an ordinary source:
 
 ```bash
