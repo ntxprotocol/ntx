@@ -10,7 +10,8 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 
 use crate::protocol::{
-    Endpoint, ErrorCode, ErrorMessage, Hello, Message, PairingProof, Publish, Subscribe, check_endpoint,
+    Endpoint, ErrorCode, ErrorMessage, Hello, Message, PairingProof, Publish, Subscribe, check_channels,
+    check_endpoint,
 };
 use crate::wire::{self, Ended, HANDSHAKE_TIMEOUT, Peer};
 use crate::{DEFAULT_PORT, Error, PROTOCOL_VERSION, Result, SUBPROTOCOL, pairing};
@@ -72,6 +73,7 @@ impl Settings {
     ) -> Result<Settings> {
         let me = Endpoint { id, name };
         check_endpoint(&me)?;
+        check_channels(&channels, false)?;
         Ok(Settings {
             role,
             url,
@@ -80,6 +82,11 @@ impl Settings {
             pairing_code,
             reconnect,
         })
+    }
+
+    /// Whether this endpoint asked for `channel`.
+    pub(crate) fn wants(&self, channel: &str) -> bool {
+        self.channels.iter().any(|c| c == channel)
     }
 
     /// The answer to `hello`, with the pairing proof if one was asked for. A receiver asks only

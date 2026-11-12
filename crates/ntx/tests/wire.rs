@@ -218,6 +218,10 @@ fn receiver_filters_repeats_and_reports_everything_else() {
     write(&mut ws, &update(3, "three"));
     write(&mut ws, &update(3, "three again"));
     write(&mut ws, &update(2, "older"));
+    // A channel it did not subscribe to (clause 8.3) is ignored.
+    let mut other = update(9, "other");
+    other["channel"] = json!("c1");
+    write(&mut ws, &other);
     write(&mut ws, &json!({"op": "com.example.future"}));
     write(
         &mut ws,

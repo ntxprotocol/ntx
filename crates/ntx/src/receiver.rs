@@ -269,7 +269,11 @@ impl Link {
                         self.send(ReceiverEvent::Announce(types));
                     }
                 }
-                if self.seen.is_new(&update) {
+                // Only channels it subscribed to (clause 8.3): a source sending others could
+                // otherwise grow `seen` and the application's state without limit.
+                if !self.settings.wants(&update.channel) {
+                    tracing::debug!("ignored an update for unsubscribed channel {:?}", update.channel);
+                } else if self.seen.is_new(&update) {
                     self.send(ReceiverEvent::Update(Update {
                         fields: wire::normalize_fields(update.fields),
                         ..update

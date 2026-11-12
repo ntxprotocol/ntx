@@ -7,8 +7,8 @@ use std::time::Duration;
 use common::{WAIT, next_update, receiver, receiver_config, source, text, wait_for};
 use ntx::protocol::ErrorCode;
 use ntx::{
-    Browser, BrowserEvent, Error, Fields, Receiver, ReceiverEvent, Source, SourceConfig, SourceEvent, Tally,
-    TypeDescriptor,
+    Browser, BrowserEvent, Error, Fields, Receiver, ReceiverConfig, ReceiverEvent, Source, SourceConfig,
+    SourceEvent, Tally, TypeDescriptor,
 };
 use serde_json::json;
 
@@ -143,6 +143,18 @@ fn start_errors() {
     let mut config = SourceConfig::new("TEST");
     config.channels = vec!["preview".into()];
     assert!(matches!(Source::start(config), Err(Error::UnknownChannel(_))));
+    // Channel lists must be valid (clause 18.4), or `hello` would break the schema.
+    for channels in [vec!["program", "program"], vec!["program", ""]] {
+        let mut config = SourceConfig::new("TEST");
+        config.channels = channels.into_iter().map(String::from).collect();
+        assert!(matches!(Source::start(config), Err(Error::InvalidMessage(_))));
+    }
+    let mut config = ReceiverConfig::new("TEST");
+    config.channels = vec!["program".into(), "program".into()];
+    assert!(matches!(
+        Receiver::connect("127.0.0.1:1", config),
+        Err(Error::InvalidMessage(_))
+    ));
 
     let taken = source(None);
     let mut config = SourceConfig::new("TEST");

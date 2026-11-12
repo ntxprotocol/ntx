@@ -19,8 +19,9 @@ pub(crate) struct Store {
 }
 
 impl Store {
-    /// An empty store. `channels` must include `program`.
+    /// An empty store. `channels` must be valid (clause 18.4) and include `program`.
     pub(crate) fn new(channels: Vec<String>) -> Result<Store> {
+        crate::protocol::check_channels(&channels, false)?;
         if !channels.iter().any(|c| c == PROGRAM) {
             return Err(Error::UnknownChannel(PROGRAM.to_string()));
         }

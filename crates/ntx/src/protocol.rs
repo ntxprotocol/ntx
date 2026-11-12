@@ -125,12 +125,32 @@ pub struct Announce {
     pub types: Vec<TypeDescriptor>,
 }
 
+/// Reads a JSON Schema `integer`, which may also be written with a zero fraction, as in `42.0`
+/// (clause 7.3: the schemas are normative).
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "the float is a whole number from 0 to 2^53 - 1, which converts exactly"
+)]
+fn schema_integer<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<u64, D::Error> {
+    let n = serde_json::Number::deserialize(d)?;
+    n.as_u64()
+        .or_else(|| {
+            n.as_f64()
+                .filter(|f| *f >= 0.0 && f.fract() == 0.0 && *f <= MAX_SEQ as f64)
+                .map(|f| f as u64)
+        })
+        .ok_or_else(|| serde::de::Error::custom(format!("{n} is not a whole number from 0 to 2^53 - 1")))
+}
+
 /// The complete new item of a channel (clause 9.1).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Update {
     /// The channel, e.g. `program`.
     pub channel: String,
     /// Sequence number; newer items have larger numbers (clause 9.4).
+    #[serde(deserialize_with = "schema_integer")]
     pub seq: u64,
     /// The item's type, e.g. `ntx.text`.
     #[serde(rename = "type")]
@@ -513,7 +533,7 @@ pub(crate) fn check_endpoint(e: &Endpoint) -> Result<()> {
     check_len("name", &e.name, 1, MAX_NAME_CHARS)
 }
 
-fn check_channels(channels: &[String], needs_program: bool) -> Result<()> {
+pub(crate) fn check_channels(channels: &[String], needs_program: bool) -> Result<()> {
     for (i, c) in channels.iter().enumerate() {
         check_len("channel", c, 1, 64)?;
         if channels[..i].contains(c) {
@@ -605,6 +625,25 @@ mod tests {
             r#"{"op":"update","channel":"program","seq":1,"type":"ntx.text","fields":{"text":"hi"}}"#
         );
         assert_eq!(Message::parse(&m.to_json()).unwrap(), Some(m));
+    }
+
+    #[test]
+    fn seq_is_a_schema_integer() {
+        let parse = |seq: &str| {
+            Message::parse(&format!(
+                r#"{{"op":"update","channel":"program","seq":{seq},"type":"ntx.text","fields":{{}}}}"#
+            ))
+        };
+        // A JSON Schema integer may have a zero fraction (clause 7.3).
+        for seq in ["42", "42.0", "4.2e1"] {
+            assert!(
+                matches!(parse(seq), Ok(Some(Message::Update(Update { seq: 42, .. })))),
+                "{seq}"
+            );
+        }
+        for seq in ["42.5", "-1", "-0.5", "9007199254740992.0", "\"42\""] {
+            assert!(parse(seq).is_err(), "{seq}");
+        }
     }
 
     #[test]
