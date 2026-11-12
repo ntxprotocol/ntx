@@ -246,7 +246,7 @@ fn errors_are_reported() {
     assert!(last_error().contains("colour"));
     assert_eq!(
         source_start(&c(r#"{"name":"x","channels":["preview"]}"#)),
-        Err(NTX_ERR_FAILED)
+        Err(NTX_ERR_UNKNOWN_CHANNEL)
     );
     assert_eq!(source_start(c"\xff"), Err(NTX_ERR_ARGUMENT));
     assert!(last_error().contains("UTF-8"));
@@ -254,7 +254,7 @@ fn errors_are_reported() {
     let source = start(&json!({"name": "errors", "bind": "127.0.0.1", "port": 0, "advertise": false}));
     assert_eq!(
         update(ntx_source_update, source, "Bad Name", "{}"),
-        Err(NTX_ERR_FAILED)
+        Err(NTX_ERR_INVALID_TYPE_NAME)
     );
     assert!(last_error().contains("invalid type name"));
     assert_eq!(
@@ -264,7 +264,10 @@ fn errors_are_reported() {
     assert_eq!(with_string(ntx_source_announce, source, "[1]"), NTX_ERR_ARGUMENT);
     assert_eq!(event(ntx_source_wait_event, ptr::null(), 0), None);
 
-    assert_eq!(connect("http://x", r#"{"name":"r"}"#), Err(NTX_ERR_FAILED));
+    assert_eq!(
+        connect("http://x", r#"{"name":"r"}"#),
+        Err(NTX_ERR_INVALID_ADDRESS)
+    );
     assert_eq!(set_tally(ptr::null(), true), NTX_ERR_ARGUMENT);
 
     // SAFETY: freeing null is allowed.
@@ -381,7 +384,7 @@ fn publisher_through_relay() {
 fn publisher_and_relay_errors() {
     assert_eq!(
         publisher_connect("http://x", r#"{"name":"p"}"#),
-        Err(NTX_ERR_FAILED)
+        Err(NTX_ERR_INVALID_ADDRESS)
     );
     assert_eq!(
         publisher_connect("localhost", r#"{"nme":"p"}"#),
@@ -392,9 +395,15 @@ fn publisher_and_relay_errors() {
         NTX_ERR_ARGUMENT
     );
     let relay = relay_start(&json!({"name": "errors", "port": 0, "advertise": false}));
-    assert_eq!(with_string(ntx_relay_allow_origin, relay, "null"), NTX_ERR_FAILED);
+    assert_eq!(
+        with_string(ntx_relay_allow_origin, relay, "null"),
+        NTX_ERR_INVALID_ORIGIN
+    );
     assert!(last_error().contains("invalid origin"));
-    assert_eq!(with_string(ntx_relay_revoke_origin, relay, "x"), NTX_ERR_FAILED);
+    assert_eq!(
+        with_string(ntx_relay_revoke_origin, relay, "x"),
+        NTX_ERR_INVALID_ORIGIN
+    );
     // SAFETY: a handle from this library, freed once.
     unsafe { ntx_relay_free(relay) };
     assert_eq!(event(ntx_relay_wait_event, ptr::null(), 0), None);

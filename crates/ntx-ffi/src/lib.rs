@@ -36,8 +36,26 @@ use serde::{Deserialize, Serialize};
 pub const NTX_OK: c_int = 0;
 /// A null pointer, invalid UTF-8 or invalid JSON was passed.
 pub const NTX_ERR_ARGUMENT: c_int = -1;
-/// The operation failed; see [`ntx_last_error`].
+/// The operation failed for another reason (an internal error); see [`ntx_last_error`].
 pub const NTX_ERR_FAILED: c_int = -2;
+/// A network or operating system error.
+pub const NTX_ERR_IO: c_int = -3;
+/// mDNS could not start or register.
+pub const NTX_ERR_MDNS: c_int = -4;
+/// A type name is not valid (clause 15.2).
+pub const NTX_ERR_INVALID_TYPE_NAME: c_int = -5;
+/// The source has no such channel.
+pub const NTX_ERR_UNKNOWN_CHANNEL: c_int = -6;
+/// A message is over the size limit (clause 18.1).
+pub const NTX_ERR_TOO_LARGE: c_int = -7;
+/// An address could not be understood.
+pub const NTX_ERR_INVALID_ADDRESS: c_int = -8;
+/// A web origin is not of the form `http(s)://host[:port]` (clause 14.5).
+pub const NTX_ERR_INVALID_ORIGIN: c_int = -9;
+/// A binding pattern is not valid (clause 16.3).
+pub const NTX_ERR_INVALID_PATTERN: c_int = -10;
+/// A message is not valid NTX.
+pub const NTX_ERR_INVALID_MESSAGE: c_int = -11;
 
 /// A running source.
 pub struct NtxSource(Source);
@@ -63,7 +81,18 @@ struct Failure(c_int, String);
 
 impl From<ntx::Error> for Failure {
     fn from(e: ntx::Error) -> Self {
-        Failure(NTX_ERR_FAILED, e.to_string())
+        let code = match e {
+            ntx::Error::Io(_) => NTX_ERR_IO,
+            ntx::Error::Mdns(_) => NTX_ERR_MDNS,
+            ntx::Error::InvalidTypeName(_) => NTX_ERR_INVALID_TYPE_NAME,
+            ntx::Error::UnknownChannel(_) => NTX_ERR_UNKNOWN_CHANNEL,
+            ntx::Error::TooLarge(_) => NTX_ERR_TOO_LARGE,
+            ntx::Error::InvalidAddress(_) => NTX_ERR_INVALID_ADDRESS,
+            ntx::Error::InvalidOrigin(_) => NTX_ERR_INVALID_ORIGIN,
+            ntx::Error::InvalidPattern(_) => NTX_ERR_INVALID_PATTERN,
+            ntx::Error::InvalidMessage(_) => NTX_ERR_INVALID_MESSAGE,
+        };
+        Failure(code, e.to_string())
     }
 }
 
@@ -947,4 +976,38 @@ pub unsafe extern "C" fn ntx_relay_info(relay: *const NtxRelay) -> *mut c_char {
 pub unsafe extern "C" fn ntx_relay_free(relay: *mut NtxRelay) {
     // SAFETY: as documented, a handle from this library that has not been freed.
     unsafe { free(relay) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_core_error_has_its_own_code() {
+        let s = String::new;
+        let cases = [
+            (ntx::Error::Io(std::io::Error::other("x")), NTX_ERR_IO),
+            (ntx::Error::Mdns(s()), NTX_ERR_MDNS),
+            (ntx::Error::InvalidTypeName(s()), NTX_ERR_INVALID_TYPE_NAME),
+            (ntx::Error::UnknownChannel(s()), NTX_ERR_UNKNOWN_CHANNEL),
+            (ntx::Error::TooLarge(1), NTX_ERR_TOO_LARGE),
+            (ntx::Error::InvalidAddress(s()), NTX_ERR_INVALID_ADDRESS),
+            (ntx::Error::InvalidOrigin(s()), NTX_ERR_INVALID_ORIGIN),
+            (ntx::Error::InvalidPattern(s()), NTX_ERR_INVALID_PATTERN),
+            (ntx::Error::InvalidMessage(s()), NTX_ERR_INVALID_MESSAGE),
+        ];
+        let codes: Vec<c_int> = cases
+            .into_iter()
+            .map(|(e, code)| {
+                let failure = Failure::from(e);
+                assert_eq!(failure.0, code, "{}", failure.1);
+                code
+            })
+            .collect();
+        assert_eq!(
+            codes,
+            (-11..=-3).rev().collect::<Vec<_>>(),
+            "codes are stable and unique"
+        );
+    }
 }

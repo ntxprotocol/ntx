@@ -39,6 +39,11 @@ All notable changes are listed here. The format follows
   frame.
 - `Receiver::reconnect` and `Publisher::reconnect` (C ABI: `ntx_receiver_reconnect`,
   `ntx_publisher_reconnect`): connect again now, also after an error that stopped reconnecting.
+- C ABI error codes for each kind of core error, so bindings can tell them apart:
+  `NTX_ERR_IO` (-3), `NTX_ERR_MDNS` (-4), `NTX_ERR_INVALID_TYPE_NAME` (-5),
+  `NTX_ERR_UNKNOWN_CHANNEL` (-6), `NTX_ERR_TOO_LARGE` (-7), `NTX_ERR_INVALID_ADDRESS` (-8),
+  `NTX_ERR_INVALID_ORIGIN` (-9), `NTX_ERR_INVALID_PATTERN` (-10) and `NTX_ERR_INVALID_MESSAGE`
+  (-11). Before, all of them were `NTX_ERR_FAILED` (-2), which now means an internal error only.
 
 ### Fixed
 

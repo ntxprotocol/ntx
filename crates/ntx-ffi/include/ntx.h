@@ -28,8 +28,35 @@
 // A null pointer, invalid UTF-8 or invalid JSON was passed.
 #define NTX_ERR_ARGUMENT -1
 
-// The operation failed; see [`ntx_last_error`].
+// The operation failed for another reason (an internal error); see [`ntx_last_error`].
 #define NTX_ERR_FAILED -2
+
+// A network or operating system error.
+#define NTX_ERR_IO -3
+
+// mDNS could not start or register.
+#define NTX_ERR_MDNS -4
+
+// A type name is not valid (clause 15.2).
+#define NTX_ERR_INVALID_TYPE_NAME -5
+
+// The source has no such channel.
+#define NTX_ERR_UNKNOWN_CHANNEL -6
+
+// A message is over the size limit (clause 18.1).
+#define NTX_ERR_TOO_LARGE -7
+
+// An address could not be understood.
+#define NTX_ERR_INVALID_ADDRESS -8
+
+// A web origin is not of the form `http(s)://host[:port]` (clause 14.5).
+#define NTX_ERR_INVALID_ORIGIN -9
+
+// A binding pattern is not valid (clause 16.3).
+#define NTX_ERR_INVALID_PATTERN -10
+
+// A message is not valid NTX.
+#define NTX_ERR_INVALID_MESSAGE -11
 
 // An mDNS browser looking for sources.
 typedef struct NtxBrowser NtxBrowser;
