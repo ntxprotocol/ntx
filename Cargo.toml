@@ -8,7 +8,7 @@ edition = "2024"
 rust-version = "1.87"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ntxprotocol/ntx"
-homepage = "https://ntxprotocol.com"
+homepage = "https://github.com/ntxprotocol"
 authors = ["CamelCase Technologies Ltd and the NTX contributors"]
 
 [workspace.lints.rust]
