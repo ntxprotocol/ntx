@@ -29,11 +29,17 @@ sending text, not video, between apps on a local network.
 | [`crates/ntx-cli`](crates/ntx-cli) | `ntx` command: a test sender, receiver, publisher and relay |
 | [`crates/ntx-ffi`](crates/ntx-ffi) | C library (`libntx_ffi`) and header [`ntx.h`](crates/ntx-ffi/include/ntx.h) |
 
-Planned in this repository: thin wrappers for Python, Node, Java and .NET on top of the C library.
+The language SDKs live in their own repositories and use this core: `ntx-python`, `ntx-node`,
+`ntx-dotnet`, `ntx-java` and `ntx-web` (TypeScript for browsers). They are not public yet.
 
 ## Try it
 
-You need [Rust](https://rustup.rs) 1.87 or newer.
+You need [Rust](https://rustup.rs) 1.87 or newer and [Git](https://git-scm.com). Get the code:
+
+```bash
+git clone https://github.com/ntxprotocol/ntx
+cd ntx
+```
 
 Send text (each line you type is sent; an empty line clears):
 
@@ -53,8 +59,20 @@ Receive and print the text:
 cargo run -p ntx-cli -- recv 127.0.0.1 --field text
 ```
 
-Useful options: `--pair 1234` (pairing code), `--preview` (also offer a preview channel),
-`--json --type com.example.lyrics` (send JSON fields), `--pattern "{reference} · {version}"`.
+**On two computers:** run `send` on one, and on the other use `list` to find it, then
+`recv <its IP address>`. Both must be on the same network, and the sender's firewall must allow
+incoming connections on TCP port 7686 (and mDNS, UDP port 5353, for `list`). Windows asks the first
+time `send` runs: allow it on private networks.
+
+Useful options (`--help` on each command lists them all):
+
+| Command | Options |
+| --- | --- |
+| `send` | `--name`, `--port`, `--pair 1234` (pairing code), `--preview` (also a preview channel), `--json --type com.example.lyrics` (send JSON fields), `--channel`, `--no-mdns` |
+| `recv` | `--pair`, `--field text`, `--pattern "{reference} · {version}"`, `--channel`, `--on-air`, `--count` |
+| `list` | `--seconds` |
+| `relay` | `--port`, `--pair`, `--allow-origin`, `--no-mdns` |
+| `publish` | `--name`, `--pair`, `--preview`, `--json --type …`, `--channel` |
 
 Programs that cannot accept connections, such as web pages, publish through a relay
 ([spec clause 14](https://github.com/ntxprotocol/spec)). Run a relay, then publish to it; the relay
@@ -80,20 +98,35 @@ is off unless a relay runs.
 
 ## Use the library
 
+Add it to your `Cargo.toml` (it is not on crates.io yet):
+
+```toml
+[dependencies]
+ntx = { git = "https://github.com/ntxprotocol/ntx" }
+```
+
+Send a line of text and receive it on the same computer
+([`crates/ntx/examples/hello.rs`](crates/ntx/examples/hello.rs); run it with
+`cargo run -p ntx --example hello`):
+
 ```rust
 use std::time::Duration;
-use ntx::{Receiver, ReceiverConfig, ReceiverEvent, Source, SourceConfig};
 
-let source = Source::start(SourceConfig::new("CHURCH-PC (Lyrics)"))?;
-source.update_text("program", "Amazing grace, how sweet the sound")?;
+use ntx::{Receiver, ReceiverConfig, ReceiverEvent, Source, SourceConfig, display_name};
 
-let receiver = Receiver::connect("127.0.0.1", ReceiverConfig::new("MEDIA-PC (Display)"))?;
-while let Some(event) = receiver.wait_event(Duration::from_secs(5)) {
-    if let ReceiverEvent::Update { fields, .. } = event {
-        println!("{}", ntx::binding::field_text(&fields, "text"));
+fn main() -> Result<(), ntx::Error> {
+    let source = Source::start(SourceConfig::new(display_name("Lyrics")))?;
+    source.update_text("program", "Amazing grace, how sweet the sound")?;
+
+    let receiver = Receiver::connect("127.0.0.1", ReceiverConfig::new(display_name("Display")))?;
+    while let Some(event) = receiver.wait_event(Duration::from_secs(5)) {
+        if let ReceiverEvent::Update(update) = event {
+            println!("{}", ntx::binding::field_text(&update.fields, "text"));
+            break;
+        }
     }
+    Ok(())
 }
-# Ok::<(), ntx::Error>(())
 ```
 
 Everything networked runs on a background thread. Events are **queued and read with
@@ -107,6 +140,8 @@ All checks run automatically before each commit and push, and again in CI. Set u
 ```bash
 brew install pre-commit cargo-llvm-cov cargo-deny cbindgen   # or your platform's equivalent
 cargo install cargo-machete
+rustup toolchain install 1.87
+rustup target add x86_64-unknown-linux-gnu x86_64-pc-windows-msvc
 pre-commit install
 ```
 
@@ -114,8 +149,15 @@ Run everything by hand:
 
 ```bash
 pre-commit run --all-files --hook-stage pre-commit   # format, lint, secrets
-pre-commit run --all-files --hook-stage pre-push     # tests, coverage >= 90%, docs, licences, duplication
+pre-commit run --all-files --hook-stage pre-push     # tests, coverage >= 90%, docs, licences, duplication,
+                                                     # Linux and Windows lint, Rust 1.87
 ```
+
+Only CI runs the tests on Linux and Windows; the hooks lint those platforms' code from any computer.
+
+On **Windows**, use the MSVC Rust toolchain (rustup's default) with the
+[Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+("Desktop development with C++").
 
 Tests include **surface tests** that run the real `ntx` binary and real sockets
 (`crates/ntx-cli/tests/`, `crates/ntx/tests/`). They also check the spec's examples when the
