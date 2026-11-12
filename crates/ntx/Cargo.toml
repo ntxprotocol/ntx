@@ -11,6 +11,8 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
+# What goes to crates.io: no tests. The licence files link to the ones at the root.
+include = ["src/**", "examples/**", "LICENSE-*"]
 
 [dependencies]
 base64 = "0.23.1"

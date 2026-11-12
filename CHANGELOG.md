@@ -76,6 +76,9 @@ All notable changes are listed here. The format follows
 - Clause 18.2: `fields` nested deeper than 16 levels are refused: `bad_message` when received,
   `Error::InvalidMessage` when sent. Before, only serde's limit of 128 levels applied.
 
+- The `ntx` and `ntx-ffi` packages include the licence files (`LICENSE-MIT`, `LICENSE-APACHE`)
+  and leave out the tests.
+
 ### Changed
 
 Following the spec's interop errata (spec commit `d76e9ba`):
