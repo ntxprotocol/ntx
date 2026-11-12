@@ -488,3 +488,38 @@ fn reconnect_connects_again_when_reconnecting_is_off() {
     r.reconnect();
     assert!(connects_within(&listener, WAIT));
 }
+
+#[test]
+fn a_receiver_does_not_subscribe_to_nothing() {
+    // Clause 8.3: ask for at least one channel the source has; otherwise nothing would arrive.
+    let (listener, url) = fake_server("/");
+    let r = Receiver::connect(&url, receiver_config(&["preview"], None)).unwrap();
+    let mut ws = accept(&listener);
+    write(&mut ws, &hello("0.1"));
+    let close = loop {
+        match ws.read().unwrap() {
+            WsMessage::Close(frame) => break frame.unwrap().code,
+            WsMessage::Text(text) => panic!("sent {text}"),
+            _ => {}
+        }
+    };
+    assert_eq!(u16::from(close), 1000);
+    assert!(disconnect_reason(&r).contains("none of the requested channels"));
+}
+
+#[test]
+fn a_receiver_closes_with_4008_without_hello() {
+    let (listener, url) = fake_server("/");
+    let r = one_shot_receiver(&url);
+    let mut ws = accept(&listener);
+    ws.get_ref()
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    let close = loop {
+        if let WsMessage::Close(frame) = ws.read().unwrap() {
+            break frame.unwrap().code;
+        }
+    };
+    assert_eq!(u16::from(close), 4008);
+    assert!(disconnect_reason(&r).contains("no hello"));
+}

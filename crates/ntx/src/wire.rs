@@ -33,7 +33,7 @@ const PING_AFTER: Duration = Duration::from_secs(5);
 const DEAD_AFTER: Duration = Duration::from_secs(15);
 
 /// Close code for a timeout (clause 12.5): no `subscribe` in time, or a silent peer.
-const TIMEOUT_CLOSE: u16 = 4008;
+pub(crate) const TIMEOUT_CLOSE: u16 = 4008;
 
 /// How long the first message of a handshake may take (clause 8.6).
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);

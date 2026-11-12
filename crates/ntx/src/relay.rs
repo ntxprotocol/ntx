@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc as tmpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::protocol::{Endpoint, ErrorCode, Hello, Message, Publish, Tally};
+use crate::protocol::{Endpoint, ErrorCode, Hello, Message, Publish, Tally, check_endpoint};
 use crate::source::Mdns;
 use crate::wire::{self, Ended, Incoming, Peer, lock};
 use crate::{DEFAULT_PORT, Error, PROGRAM, PROTOCOL_VERSION, Result, Source, SourceConfig, display_name};
@@ -148,7 +148,8 @@ impl Relay {
     ///
     /// # Errors
     ///
-    /// Fails if an allowed origin is invalid, `bind` is not a loopback address but there is no
+    /// Fails if the id or name is empty or too long (clause 18.4), an allowed origin is invalid,
+    /// `bind` is not a loopback address but there is no
     /// pairing code, the port cannot be opened, or mDNS cannot start.
     pub fn start(config: RelayConfig) -> Result<Relay> {
         // Beyond this computer, anyone can send any Origin header (clause 20.2).
@@ -158,6 +159,11 @@ impl Relay {
                 config.bind
             )));
         }
+        let identity = Endpoint {
+            id: config.id,
+            name: config.name,
+        };
+        check_endpoint(&identity)?;
         let allowed = config
             .allowed_origins
             .iter()
@@ -167,10 +173,7 @@ impl Relay {
         let mdns = config.advertise.then(Mdns::new).transpose()?.map(Arc::new);
         let (events_tx, events_rx) = mpsc::channel();
         let shared = Arc::new(Shared {
-            identity: Endpoint {
-                id: config.id,
-                name: config.name,
-            },
+            identity,
             path: config.path,
             pairing_code: config.pairing_code,
             mdns,

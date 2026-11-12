@@ -313,4 +313,8 @@ fn names_and_ids_must_fit_hello() {
     let mut config = common::publisher_config("p", None);
     config.name = "n".repeat(257);
     assert!(ntx::Publisher::connect("127.0.0.1:1", config).is_err());
+    let mut config = ntx::RelayConfig::new("n".repeat(300));
+    config.port = 0;
+    config.advertise = false;
+    assert!(matches!(ntx::Relay::start(config), Err(Error::InvalidMessage(_))));
 }

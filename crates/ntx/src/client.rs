@@ -83,29 +83,35 @@ impl Settings {
     }
 
     /// The answer to `hello`, with the pairing proof if one was asked for. A receiver asks only
-    /// for channels the source has (clause 8.3).
-    fn answer(&self, hello: &Hello, pairing: Option<PairingProof>) -> Message {
+    /// for channels the source has, and for at least one (clause 8.3): `None` when the source
+    /// has none of them.
+    fn answer(&self, hello: &Hello, pairing: Option<PairingProof>) -> Option<Message> {
         let (ntx, me) = (PROTOCOL_VERSION.to_string(), self.me.clone());
-        match self.role {
-            Role::Receiver => Message::Subscribe(Subscribe {
-                ntx,
-                receiver: me,
-                channels: Some(
-                    self.channels
-                        .iter()
-                        .filter(|c| hello.channels.contains(c))
-                        .cloned()
-                        .collect(),
-                ),
-                pairing,
-            }),
+        Some(match self.role {
+            Role::Receiver => {
+                let channels: Vec<_> = self
+                    .channels
+                    .iter()
+                    .filter(|c| hello.channels.contains(c))
+                    .cloned()
+                    .collect();
+                if channels.is_empty() {
+                    return None;
+                }
+                Message::Subscribe(Subscribe {
+                    ntx,
+                    receiver: me,
+                    channels: Some(channels),
+                    pairing,
+                })
+            }
             Role::Publisher => Message::Publish(Publish {
                 ntx,
                 source: me,
                 channels: Some(self.channels.clone()),
                 pairing,
             }),
-        }
+        })
     }
 }
 
@@ -126,21 +132,27 @@ impl From<Ended> for Failed {
 
 /// Connects, waits for `hello` and answers it (clauses 8 and 14.2).
 async fn handshake(settings: &Settings) -> std::result::Result<(Connection, Hello), Failed> {
-    let connect = async {
-        let (mut peer, hello, proof) = connect(&settings.url, settings.pairing_code.as_deref()).await?;
-        peer.send(&settings.answer(&hello, proof)).await?;
-        peer.handshake_done();
-        Ok((peer, hello))
-    };
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, connect)
+    let mut peer = tokio::time::timeout(HANDSHAKE_TIMEOUT, open(&settings.url))
         .await
-        .unwrap_or_else(|_| Err(Ended("no hello".into()).into()))
+        .map_err(|_| Ended("no WebSocket upgrade".into()))??;
+    let Ok(first) = tokio::time::timeout(HANDSHAKE_TIMEOUT, peer.recv()).await else {
+        let reason = "no hello within 10 seconds";
+        peer.close(Some((wire::TIMEOUT_CLOSE, reason))).await;
+        return Err(Ended(reason.into()).into());
+    };
+    let (hello, proof) = greeted(&mut peer, first?, settings.pairing_code.as_deref()).await?;
+    let Some(answer) = settings.answer(&hello, proof) else {
+        let reason = "the source has none of the requested channels";
+        peer.close(Some((1000, reason))).await;
+        return Err(Ended(reason.into()).into());
+    };
+    peer.send(&answer).await?;
+    peer.handshake_done();
+    Ok((peer, hello))
 }
 
-async fn connect(
-    url: &str,
-    pairing_code: Option<&str>,
-) -> std::result::Result<(Connection, Hello, Option<PairingProof>), Failed> {
+/// Opens the WebSocket connection, offering the `ntx` subprotocol (clause 5.2).
+async fn open(url: &str) -> std::result::Result<Connection, Ended> {
     let mut request = url.into_client_request().map_err(|e| Ended(e.to_string()))?;
     request
         .headers_mut()
@@ -148,8 +160,16 @@ async fn connect(
     let (ws, _) = tokio_tungstenite::connect_async_with_config(request, Some(wire::ws_config()), true)
         .await
         .map_err(|e| Ended(e.to_string()))?;
-    let mut peer = Peer::new(ws, "hello");
-    let hello = match peer.recv().await? {
+    Ok(Peer::new(ws, "hello"))
+}
+
+/// Checks the first message, which should be `hello`, and computes the pairing proof.
+async fn greeted(
+    peer: &mut Connection,
+    first: Message,
+    pairing_code: Option<&str>,
+) -> std::result::Result<(Hello, Option<PairingProof>), Failed> {
+    let hello = match first {
         Message::Hello(hello) => hello,
         Message::Error(e) => return Err(Failed::Error(e)),
         _ => {
@@ -182,7 +202,7 @@ async fn connect(
             }));
         }
     };
-    Ok((peer, hello, proof))
+    Ok((hello, proof))
 }
 
 /// What the owner of a receiver or publisher wants from its background task.
