@@ -310,11 +310,27 @@ fn discovery_finds_and_loses_a_source() {
     );
     assert_ne!(found.addresses, Vec::<std::net::IpAddr>::new());
 
-    drop(s);
+    // The same id under a second name (say, a renamed source whose old record lingers): when
+    // that record goes, the source is not lost, as it is still known under the first name.
+    let mut config = SourceConfig::new("TEST (discovery, renamed)");
+    config.port = 0;
+    config.id = id.clone();
+    let renamed = Source::start(config).unwrap();
     wait_for(
         || browser.wait_event(Duration::from_secs(10)),
-        |e| matches!(e, BrowserEvent::Lost { id: ref lost, .. } if *lost == id).then_some(()),
+        |e| matches!(e, BrowserEvent::Found(f) if f.id == id && f.name.ends_with("renamed)")).then_some(()),
     );
+    drop(renamed);
+
+    drop(s);
+    let lost = wait_for(
+        || browser.wait_event(Duration::from_secs(10)),
+        |e| match e {
+            BrowserEvent::Lost { id: lost, name } if lost == id => Some(name),
+            _ => None,
+        },
+    );
+    assert_eq!(lost, "TEST (discovery)", "lost only when the last record went");
     assert!(
         browser
             .poll_event()

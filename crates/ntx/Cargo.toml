@@ -17,6 +17,7 @@ base64 = "0.23.1"
 futures-util = "0.3.34"
 gethostname = "1.1.0"
 hmac = "0.13.0"
+if-addrs = "0.15.0"
 mdns-sd = "0.21.7"
 ryu-js = "1.0.3"
 serde = { version = "1.0.229", features = ["derive"] }

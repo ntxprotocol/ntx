@@ -68,6 +68,11 @@ All notable changes are listed here. The format follows
   falls back to the host name. Before, Preview could fail with "No route to host".
 - Dropping a `Source` or `Relay` waits (up to 1 second) until its connections have sent their
   close frames, so a program that exits right away no longer resets them.
+- Discovery prefers an address on the network of the default route, so a source's URL no longer
+  flips to a virtual machine bridge (such as 192.168.64.1) between runs. When one of two mDNS
+  records with the same source id goes away, `Browser` reports the source `Found` under the other
+  one instead of `Lost`. `ntx list` collects what it finds and lists each source id once, with
+  its latest address; it no longer prints `gone:` lines.
 - Clause 18.2: `fields` nested deeper than 16 levels are refused: `bad_message` when received,
   `Error::InvalidMessage` when sent. Before, only serde's limit of 128 levels applied.
 

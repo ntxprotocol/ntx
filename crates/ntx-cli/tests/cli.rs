@@ -215,9 +215,14 @@ fn list_finds_an_advertised_sender() {
     let host = gethostname::gethostname().to_string_lossy().into_owned();
     let machine = host.split('.').next().unwrap_or(&host).to_uppercase();
     let full_name = format!("{machine} ({name})");
-    let listed = stdout(&output)
-        .into_iter()
-        .find(|l| l.ends_with("id surface-list"));
+    let lines = stdout(&output);
+    // Each source once, however often mDNS reports it.
+    assert_eq!(
+        lines.iter().filter(|l| l.ends_with("id surface-list")).count(),
+        1,
+        "{output:?}"
+    );
+    let listed = lines.into_iter().find(|l| l.ends_with("id surface-list"));
     let shown = listed
         .as_deref()
         .and_then(|l| l.split("  ws://").next())

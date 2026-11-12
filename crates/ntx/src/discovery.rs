@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, UdpSocket};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -36,6 +36,7 @@ pub struct DiscoveredSource {
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub enum BrowserEvent {
     /// A new source, or a change of URL, name, version or pairing for a source already found.
+    /// Several events can carry the same `id`: treat each one after the first as an update.
     Found(DiscoveredSource),
     /// A source went away.
     Lost {
@@ -116,7 +117,11 @@ impl Browser {
                 if let Some(p) = previous.filter(|p| p.port == info.port) {
                     addresses.extend(p.addresses.iter().copied());
                 }
-                let addresses = order_addresses(addresses, previous.and_then(|p| p.addresses.first()));
+                let addresses = order_addresses(
+                    addresses,
+                    previous.and_then(|p| p.addresses.first()),
+                    &default_networks(),
+                );
                 // A link-local address cannot go in a URL without its interface, so then use the
                 // host name.
                 let host = match addresses.first().filter(|a| !is_link_local_v6(a)) {
@@ -156,11 +161,21 @@ impl Browser {
                 news.then_some(BrowserEvent::Found(found))
             }
             ServiceEvent::ServiceRemoved(_, fullname) => {
-                let (id, name) = lock(&self.known).remove(&fullname).map_or_else(
+                let mut known = lock(&self.known);
+                let (id, name) = known.remove(&fullname).map_or_else(
                     || (fullname.clone(), instance_name(&fullname)),
                     |s| (s.id, s.name),
                 );
-                Some(BrowserEvent::Lost { id, name })
+                // Another record (say, the source under its old name) still has this id: the
+                // source is not gone, it is now known by that record.
+                Some(
+                    known
+                        .values()
+                        .find(|s| s.id == id)
+                        .map_or(BrowserEvent::Lost { id, name }, |s| {
+                            BrowserEvent::Found(s.clone())
+                        }),
+                )
             }
             _ => None,
         }
@@ -174,11 +189,23 @@ impl Drop for Browser {
     }
 }
 
-/// Orders addresses best first: those other computers can reach (IPv4, then IPv6), then
-/// link-local, then loopback. The address reported before stays first while it is still known
-/// and as good as the best, so the URL does not change for nothing.
-fn order_addresses(mut addresses: Vec<IpAddr>, reported: Option<&IpAddr>) -> Vec<IpAddr> {
-    let rank = |a: &IpAddr| (a.is_loopback(), is_link_local_v6(a), a.is_ipv6());
+/// Orders addresses best first: those other computers can reach, then link-local, then loopback.
+/// Among reachable ones, those on a network of the default route come first (not, say, a virtual
+/// machine bridge), then IPv4 before IPv6. The address reported before stays first while it is
+/// still known and as good as the best, so the URL does not change for nothing.
+fn order_addresses(
+    mut addresses: Vec<IpAddr>,
+    reported: Option<&IpAddr>,
+    networks: &[(IpAddr, u8)],
+) -> Vec<IpAddr> {
+    let rank = |a: &IpAddr| {
+        (
+            a.is_loopback(),
+            is_link_local_v6(a),
+            !networks.iter().any(|n| on_network(a, n)),
+            a.is_ipv6(),
+        )
+    };
     addresses.sort_by_key(|a| (rank(a), *a));
     addresses.dedup();
     if let Some(&kept) = reported.filter(|r| addresses.first().is_some_and(|best| rank(r) == rank(best))) {
@@ -187,6 +214,48 @@ fn order_addresses(mut addresses: Vec<IpAddr>, reported: Option<&IpAddr>) -> Vec
         }
     }
     addresses
+}
+
+/// The networks (address, prefix length) of the interfaces that the default routes use. The
+/// system picks the local address for an outside one; connecting a UDP socket sends nothing.
+fn default_networks() -> Vec<(IpAddr, u8)> {
+    let Ok(interfaces) = if_addrs::get_if_addrs() else {
+        return Vec::new();
+    };
+    let local = |bind: &str, outside: &str| {
+        let socket = UdpSocket::bind(bind).ok()?;
+        socket.connect(outside).ok()?;
+        socket.local_addr().ok().map(|a| a.ip())
+    };
+    // Documentation addresses (RFC 5737, RFC 3849): routed like any outside address.
+    [
+        local("0.0.0.0:0", "192.0.2.1:9"),
+        local("[::]:0", "[2001:db8::1]:9"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|ip| {
+        interfaces.iter().find_map(|i| match &i.addr {
+            if_addrs::IfAddr::V4(a) if IpAddr::V4(a.ip) == ip => Some((ip, a.prefixlen)),
+            if_addrs::IfAddr::V6(a) if IpAddr::V6(a.ip) == ip => Some((ip, a.prefixlen)),
+            _ => None,
+        })
+    })
+    .collect()
+}
+
+/// Whether `address` is on the network `(address, prefix length)`.
+fn on_network(address: &IpAddr, &(network, prefix): &(IpAddr, u8)) -> bool {
+    let bits = |a: IpAddr| match a {
+        IpAddr::V4(v4) => u128::from(v4.to_ipv6_mapped()),
+        IpAddr::V6(v6) => u128::from(v6),
+    };
+    let prefix = u32::from(prefix) + if network.is_ipv4() { 96 } else { 0 };
+    address.is_ipv4() == network.is_ipv4()
+        && (bits(*address) ^ bits(network))
+            .checked_shr(128 - prefix)
+            .unwrap_or(0)
+            == 0
 }
 
 /// IPv6 link-local addresses (`fe80::/10`) need an interface scope to be usable in a URL.
@@ -214,19 +283,55 @@ mod tests {
     fn reachable_addresses_come_first() {
         let found = ips(&["::1", "fe80::1", "2001:db8::5", "127.0.0.1", "192.0.2.7"]);
         let expected = ips(&["192.0.2.7", "2001:db8::5", "fe80::1", "127.0.0.1", "::1"]);
-        assert_eq!(order_addresses(found, None), expected);
+        assert_eq!(order_addresses(found, None, &[]), expected);
+    }
+
+    #[test]
+    fn the_default_route_network_comes_first() {
+        // A virtual machine bridge (192.168.64.1) and the LAN (192.168.1.0/24).
+        let networks = [
+            ("192.168.1.20".parse().unwrap(), 24),
+            ("2001:db8:1::9".parse().unwrap(), 64),
+        ];
+        let found = ips(&["192.168.64.1", "2001:db8:2::5", "2001:db8:1::5", "192.168.1.7"]);
+        let expected = ips(&["192.168.1.7", "2001:db8:1::5", "192.168.64.1", "2001:db8:2::5"]);
+        assert_eq!(order_addresses(found, None, &networks), expected);
+        // A bridge address reported before gives way to the LAN address.
+        let found = ips(&["192.168.64.1", "192.168.1.7"]);
+        assert_eq!(
+            order_addresses(found, Some(&ips(&["192.168.64.1"])[0]), &networks)[0],
+            ips(&["192.168.1.7"])[0]
+        );
+    }
+
+    #[test]
+    fn networks() {
+        let lan = ("10.1.2.3".parse().unwrap(), 16);
+        assert!(on_network(&ips(&["10.1.200.9"])[0], &lan));
+        assert!(!on_network(&ips(&["10.2.0.1"])[0], &lan));
+        assert!(!on_network(&ips(&["::ffff:10.1.0.1"])[0], &lan));
+        assert!(on_network(
+            &ips(&["8.8.8.8"])[0],
+            &("10.0.0.1".parse().unwrap(), 0)
+        ));
+        assert!(on_network(&ips(&["::1"])[0], &("::1".parse().unwrap(), 128)));
+        assert!(!on_network(&ips(&["::2"])[0], &("::1".parse().unwrap(), 128)));
+        // Every address found is a local one, on a network that holds it.
+        for network in default_networks() {
+            assert!(on_network(&network.0, &network));
+        }
     }
 
     #[test]
     fn the_reported_address_stays_only_while_it_is_as_good() {
         let reported: IpAddr = "192.0.2.9".parse().unwrap();
         let found = ips(&["192.0.2.7", "192.0.2.9", "fe80::1"]);
-        assert_eq!(order_addresses(found, Some(&reported))[0], reported);
+        assert_eq!(order_addresses(found, Some(&reported), &[])[0], reported);
         // Reported first, a link-local address gives way once an IPv4 address is known.
         let link_local: IpAddr = "fe80::1".parse().unwrap();
         let found = ips(&["fe80::1", "192.0.2.7"]);
         assert_eq!(
-            order_addresses(found, Some(&link_local))[0],
+            order_addresses(found, Some(&link_local), &[])[0],
             ips(&["192.0.2.7"])[0]
         );
     }

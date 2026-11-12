@@ -453,24 +453,31 @@ fn recv(args: &RecvArgs) -> CliResult {
 fn list(args: &ListArgs) -> CliResult {
     let browser = Browser::start()?;
     let deadline = Instant::now() + Duration::from_secs(args.seconds);
-    let mut found = 0;
+    // By id: a later event for a source updates it (a better address, say), so each is listed once.
+    let mut found = std::collections::HashMap::new();
     while let Some(left) = deadline.checked_duration_since(Instant::now()) {
         match browser.wait_event(left) {
             Some(BrowserEvent::Found(s)) => {
-                found += 1;
-                let pair = if s.pairing_required {
-                    "  (pairing code needed)"
-                } else {
-                    ""
-                };
-                println!("{}  {}  NTX {}  id {}{pair}", s.name, s.url, s.version, s.id);
+                found.insert(s.id.clone(), s);
             }
-            Some(BrowserEvent::Lost { name, .. }) => println!("gone: {name}"),
+            Some(BrowserEvent::Lost { id, .. }) => {
+                found.remove(&id);
+            }
             None => break,
         }
     }
-    if found == 0 {
+    if found.is_empty() {
         eprintln!("no NTX sources found (mDNS does not cross subnets or VLANs; try `ntx recv <ip>`)");
+    }
+    let mut found: Vec<_> = found.into_values().collect();
+    found.sort_by(|a, b| (&a.name, &a.id).cmp(&(&b.name, &b.id)));
+    for s in found {
+        let pair = if s.pairing_required {
+            "  (pairing code needed)"
+        } else {
+            ""
+        };
+        println!("{}  {}  NTX {}  id {}{pair}", s.name, s.url, s.version, s.id);
     }
     Ok(())
 }

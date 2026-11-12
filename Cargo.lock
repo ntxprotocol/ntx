@@ -512,6 +512,7 @@ dependencies = [
  "futures-util",
  "gethostname",
  "hmac",
+ "if-addrs",
  "mdns-sd",
  "ryu-js",
  "serde",
