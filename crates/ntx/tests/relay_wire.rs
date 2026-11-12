@@ -244,6 +244,51 @@ fn publisher_reports_a_refusal() {
 }
 
 #[test]
+fn a_refused_publisher_waits_for_the_app() {
+    // Clause 11.3: no automatic reconnect after not_allowed, even with reconnect on.
+    let (listener, url) = fake_server("/publish");
+    let p = Publisher::connect(&url, publisher_config("pub-waits", None)).unwrap();
+    let mut ws = accept(&listener);
+    write(&mut ws, &json!({"op": "error", "code": "not_allowed"}));
+    let code = wait_for(
+        || p.wait_event(WAIT),
+        |e| match e {
+            PublisherEvent::Error { code, .. } => Some(code),
+            _ => None,
+        },
+    );
+    assert_eq!(code, ErrorCode::NotAllowed);
+    wait_for(
+        || p.wait_event(WAIT),
+        |e| matches!(e, PublisherEvent::Disconnected { .. }).then_some(()),
+    );
+    listener.set_nonblocking(true).unwrap();
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(listener.accept().is_err(), "reconnected by itself");
+    listener.set_nonblocking(false).unwrap();
+    p.reconnect();
+    let mut again = accept(&listener);
+    write(&mut again, &hello(None));
+    assert_eq!(read(&mut again)["op"], "publish");
+}
+
+#[test]
+fn a_publisher_without_the_code_gives_up() {
+    let (listener, url) = fake_server("/publish");
+    let p = Publisher::connect(&url, publisher_config("pub-no-code", None)).unwrap();
+    let mut ws = accept(&listener);
+    write(&mut ws, &hello(Some("q7cJ9mV2xL0aR4tY")));
+    let code = wait_for(
+        || p.wait_event(WAIT),
+        |e| match e {
+            PublisherEvent::Error { code, .. } => Some(code),
+            _ => None,
+        },
+    );
+    assert_eq!(code, ErrorCode::PairingRequired);
+}
+
+#[test]
 fn null_and_long_origins_are_refused_cleanly() {
     let relay = relay(None, &[]);
     // `null` is always refused, and the app is never asked about it (clause 14.5).
@@ -296,4 +341,30 @@ fn pages_cannot_flood_the_user_with_questions() {
         Some(RelayEvent::OriginRequested { .. })
     ));
     assert_eq!(relay.wait_event(Duration::from_millis(300)), None);
+}
+
+#[test]
+fn a_publishers_wait_goes_back_to_one_second_after_a_long_connection() {
+    // A relay sends no update, so a connection that lasted 10 seconds resets the wait (11.3).
+    let (listener, url) = fake_server("/publish");
+    let _p = Publisher::connect(&url, publisher_config("pub-backoff", None)).unwrap();
+    // Accepts the next connection, answers its publish, and says how long it took to come.
+    let next = |since: std::time::Instant| {
+        let mut ws = accept(&listener);
+        let waited = since.elapsed();
+        write(&mut ws, &hello(None));
+        assert_eq!(read(&mut ws)["op"], "publish");
+        (ws, waited)
+    };
+    let (ws, _) = next(std::time::Instant::now());
+    drop(ws);
+    let (ws, first) = next(std::time::Instant::now());
+    drop(ws);
+    let (ws, second) = next(std::time::Instant::now());
+    assert!(first < Duration::from_millis(1800), "{first:?}");
+    assert!(second >= Duration::from_millis(1800), "{second:?}");
+    std::thread::sleep(Duration::from_millis(10_500));
+    drop(ws);
+    let (_ws, third) = next(std::time::Instant::now());
+    assert!(third < Duration::from_millis(1800), "{third:?}");
 }

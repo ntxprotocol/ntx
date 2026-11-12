@@ -151,7 +151,8 @@ fn json_fields_patterns_and_preview() {
     sender.expect("+ receiver");
     sender.line(r#"{"reference": "John 3:16", "version": "KJV"}"#);
     let output = receiver.join().unwrap();
-    assert_eq!(stdout(&output), [" · ", "John 3:16 · KJV"]);
+    // The channel starts cleared, which hides the pattern's fixed text too (clause 16.5).
+    assert_eq!(stdout(&output), ["", "John 3:16 · KJV"]);
     assert!(sender.finish().success());
 }
 
@@ -165,6 +166,14 @@ fn raw_json_output_and_pairing() {
     let update: serde_json::Value = serde_json::from_str(&stdout(&output)[0]).unwrap();
     assert_eq!(update["fields"]["text"], "secret");
     assert_eq!(update["type"], "ntx.text");
+
+    // Without the code, or with a wrong one, recv stops instead of retrying (clause 11.3).
+    for extra in [&[][..], &["--pair", "1111"]] {
+        let output = recv(&address, 1, extra).join().unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("source error: pairing_"), "{stderr}");
+    }
     assert!(sender.finish().success());
 }
 
@@ -233,10 +242,10 @@ fn publish_through_a_relay() {
     let (relay, relay_address) = relay(&["--pair", "1357"]);
     let url = format!("ws://{relay_address}/publish");
 
-    let mut unpaired = Running::start(&["publish", &url]);
+    // Without the relay's code, publish stops instead of retrying (clause 11.3).
+    let unpaired = Running::start(&["publish", &url]);
     unpaired.expect("relay error: pairing_required");
-    unpaired.line("not sent");
-    assert!(unpaired.finish().success());
+    assert!(!unpaired.finish().success());
 
     let mut publisher = Running::start(&[
         "publish",

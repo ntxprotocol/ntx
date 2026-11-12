@@ -135,8 +135,12 @@ pub fn read_json(ws: &mut Raw) -> Value {
     }
 }
 
-/// Reads until the close frame and returns its code.
+/// Reads until the close frame and returns its code. Waits up to 20 seconds, longer than the
+/// spec's timeouts.
 pub fn read_close(ws: &mut Raw) -> u16 {
+    if let MaybeTlsStream::Plain(stream) = ws.get_ref() {
+        stream.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    }
     loop {
         match ws.read() {
             Ok(WsMessage::Close(frame)) => return frame.map_or(1005, |f| f.code.into()),

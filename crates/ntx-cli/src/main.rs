@@ -231,9 +231,16 @@ fn publish(args: &PublishArgs) -> CliResult {
         PublisherEvent::Connected { relay, .. } => format!("connected to relay \"{}\"", relay.name),
         PublisherEvent::Tally(tally) => describe_tally(tally),
         PublisherEvent::Error { code, message } => {
-            format!("relay error: {} {}", code.as_str(), message.unwrap_or_default())
+            let error = format!("relay error: {} {}", code.as_str(), message.unwrap_or_default());
+            // The publisher stopped (clause 11.3). Reading standard input may block, so exit
+            // from here, like `recv` does.
+            if code.needs_user() {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+            error
         }
-        PublisherEvent::Disconnected { reason } => format!("disconnected: {reason} (retrying)"),
+        PublisherEvent::Disconnected { reason } => format!("disconnected: {reason}"),
     };
     reporting(
         |t| publisher.wait_event(t),
@@ -388,9 +395,14 @@ fn recv(args: &RecvArgs) -> CliResult {
                 println!("{line}");
             }
             Some(ReceiverEvent::Error { code, message }) => {
-                eprintln!("source error: {} {}", code.as_str(), message.unwrap_or_default());
+                let error = format!("source error: {} {}", code.as_str(), message.unwrap_or_default());
+                // Trying again cannot help until the settings change (clause 11.3).
+                if code.needs_user() {
+                    return Err(error.into());
+                }
+                eprintln!("{error}");
             }
-            Some(ReceiverEvent::Disconnected { reason }) => eprintln!("disconnected: {reason} (retrying)"),
+            Some(ReceiverEvent::Disconnected { reason }) => eprintln!("disconnected: {reason}"),
             None => {}
         }
     }

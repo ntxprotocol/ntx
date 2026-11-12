@@ -80,14 +80,40 @@ fn handshake_errors_close_with_the_right_codes() {
 }
 
 #[test]
-fn pairing_required_without_proof() {
+fn pairing_proofs_missing_or_malformed() {
+    // Clause 13.4: no `pairing` or no `proof` is pairing_required; a proof that is not
+    // 44 characters of Base64 is pairing_failed, not bad_message.
     let s = source(Some("4321"));
+    // A null proof does not match the schema at all: bad_message (clause 7.3).
+    let cases = [
+        (None, "pairing_required", 4003),
+        (Some(json!({})), "pairing_required", 4003),
+        (Some(json!({"proof": "not-base64"})), "pairing_failed", 4003),
+        (Some(json!({"proof": null})), "bad_message", 4000),
+    ];
+    for (pairing, code, close) in cases {
+        let mut ws = raw_connect(&format!("ws://{}/", s.local_addr()));
+        let hello = read_json(&mut ws);
+        assert_eq!(hello["pairing"]["nonce"].as_str().map(str::len), Some(32));
+        let mut answer = subscribe("0.1");
+        if let Some(pairing) = pairing {
+            answer["pairing"] = pairing;
+        }
+        send_json(&mut ws, &answer);
+        assert_eq!(read_json(&mut ws)["code"], code);
+        assert_eq!(read_close(&mut ws), close);
+    }
+}
+
+#[test]
+fn pairing_is_ignored_when_not_required() {
+    let s = source(None);
     let mut ws = raw_connect(&format!("ws://{}/", s.local_addr()));
-    let hello = read_json(&mut ws);
-    assert_eq!(hello["pairing"]["nonce"].as_str().map(str::len), Some(32));
-    send_json(&mut ws, &subscribe("0.1"));
-    assert_eq!(read_json(&mut ws)["code"], "pairing_required");
-    assert_eq!(read_close(&mut ws), 4003);
+    read_json(&mut ws);
+    let mut answer = subscribe("0.1");
+    answer["pairing"] = json!({"proof": "not-base64"});
+    send_json(&mut ws, &answer);
+    assert_eq!(read_json(&mut ws)["op"], "update");
 }
 
 #[test]
@@ -121,6 +147,19 @@ fn source_closes_when_dropped() {
     let mut ws = subscribed(&s);
     drop(s);
     assert_eq!(read_close(&mut ws), 1005);
+}
+
+/// Reads on a fake source until the close frame, and returns its code. Waits up to 20 seconds,
+/// longer than the spec's timeouts.
+fn fake_read_close(ws: &mut tungstenite::WebSocket<std::net::TcpStream>) -> u16 {
+    ws.get_ref()
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    loop {
+        if let WsMessage::Close(frame) = ws.read().unwrap() {
+            return frame.unwrap().code.into();
+        }
+    }
 }
 
 fn hello(ntx: &str) -> Value {
@@ -224,7 +263,8 @@ fn receiver_pings_a_quiet_source_and_gives_up_on_a_silent_one() {
     // Say nothing: the receiver pings after 5 seconds (clause 11.1).
     let ping = read(&mut ws);
     assert_eq!(ping["op"], "ping");
-    // Keep ignoring it: the receiver gives up after 15 seconds (clause 11.2).
+    // Keep ignoring it: after 15 seconds the receiver closes with 4008 (clauses 11.2, 12.5).
+    assert_eq!(fake_read_close(&mut ws), 4008);
     let reason = wait_for(
         || r.wait_event(Duration::from_secs(20)),
         |e| match e {
@@ -233,6 +273,18 @@ fn receiver_pings_a_quiet_source_and_gives_up_on_a_silent_one() {
         },
     );
     assert!(reason.contains("no answer"), "{reason}");
+}
+
+#[test]
+fn source_closes_with_4008_without_subscribe_or_when_the_receiver_is_silent() {
+    let s = source(None);
+    // No subscribe within 10 seconds (clause 8.6).
+    let mut quiet = raw_connect(&format!("ws://{}/", s.local_addr()));
+    assert_eq!(read_json(&mut quiet)["op"], "hello");
+    // A receiver that answers nothing, not even pings, for 15 seconds (clause 11.2).
+    let mut silent = subscribed(&s);
+    assert_eq!(read_close(&mut quiet), 4008);
+    assert_eq!(read_close(&mut silent), 4008);
 }
 
 #[test]
@@ -308,4 +360,160 @@ fn repeated_wrong_pairing_codes_lock_the_address_out() {
         locked["message"].as_str().unwrap().contains("try again later"),
         "{locked}"
     );
+}
+
+/// Whether a client connects to the fake server within `within`.
+fn connects_within(listener: &std::net::TcpListener, within: Duration) -> bool {
+    listener.set_nonblocking(true).unwrap();
+    let deadline = std::time::Instant::now() + within;
+    let connected = loop {
+        match listener.accept() {
+            Ok(_) => break true,
+            Err(_) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            Err(_) => break false,
+        }
+    };
+    listener.set_nonblocking(false).unwrap();
+    connected
+}
+
+fn next_error(r: &Receiver) -> ErrorCode {
+    wait_for(
+        || r.wait_event(WAIT),
+        |e| match e {
+            ReceiverEvent::Error { code, .. } => Some(code),
+            _ => None,
+        },
+    )
+}
+
+#[test]
+fn connected_only_after_the_first_update() {
+    let (listener, url) = fake_server("/");
+    let r = Receiver::connect(&url, receiver_config(&["program", "preview", "nope"], None)).unwrap();
+    let mut ws = accept(&listener);
+    let mut greeting = hello("0.1");
+    greeting["channels"] = json!(["program", "preview"]);
+    write(&mut ws, &greeting);
+    // Only channels the source listed are asked for (clause 8.3).
+    assert_eq!(read(&mut ws)["channels"], json!(["program", "preview"]));
+    write(
+        &mut ws,
+        &json!({"op": "announce", "types": [{"ntxType": "com.example.t", "schema": {"type": "object"}}]}),
+    );
+    assert_eq!(r.wait_event(Duration::from_millis(300)), None);
+    // The first update confirms the subscription; the announcement waited for it.
+    write(
+        &mut ws,
+        &json!({"op": "update", "channel": "program", "seq": 0, "type": "ntx.text", "fields": {}}),
+    );
+    let events: Vec<_> = (0..3).filter_map(|_| r.wait_event(WAIT)).collect();
+    assert!(matches!(events[0], ReceiverEvent::Connected { .. }), "{events:?}");
+    assert!(matches!(events[1], ReceiverEvent::Announce(_)), "{events:?}");
+    assert!(matches!(events[2], ReceiverEvent::Update(_)), "{events:?}");
+}
+
+#[test]
+fn errors_that_need_the_user_stop_reconnecting() {
+    // Clause 11.3: pairing_failed (and the others) from the source...
+    let (listener, url) = fake_server("/");
+    let r = Receiver::connect(&url, receiver_config(&["program"], Some("1234"))).unwrap();
+    let mut ws = accept(&listener);
+    let mut greeting = hello("0.1");
+    greeting["pairing"] = json!({"nonce": "q7cJ9mV2xL0aR4tY"});
+    write(&mut ws, &greeting);
+    read(&mut ws);
+    write(&mut ws, &json!({"op": "error", "code": "pairing_failed"}));
+    drop(ws);
+    assert_eq!(next_error(&r), ErrorCode::PairingFailed);
+    disconnect_reason(&r);
+    assert!(!connects_within(&listener, Duration::from_millis(1500)));
+    // ...until the app asks to try again.
+    r.reconnect();
+    assert!(connects_within(&listener, WAIT));
+
+    // A receiver without a pairing code gives up with 4003 instead of subscribing (clause 8.3).
+    let (listener, url) = fake_server("/");
+    let r = Receiver::connect(&url, receiver_config(&["program"], None)).unwrap();
+    let mut ws = accept(&listener);
+    write(&mut ws, &greeting);
+    assert_eq!(fake_read_close(&mut ws), 4003);
+    assert_eq!(next_error(&r), ErrorCode::PairingRequired);
+    assert!(!connects_within(&listener, Duration::from_millis(1500)));
+
+    // So does a version this receiver does not speak.
+    let (listener, url) = fake_server("/");
+    let r = Receiver::connect(&url, receiver_config(&["program"], None)).unwrap();
+    write(&mut accept(&listener), &hello("0.2"));
+    assert_eq!(next_error(&r), ErrorCode::UnsupportedVersion);
+    assert!(!connects_within(&listener, Duration::from_millis(1500)));
+}
+
+#[test]
+fn the_wait_goes_back_to_one_second_only_after_an_update() {
+    let (listener, url) = fake_server("/");
+    let _r = Receiver::connect(&url, receiver_config(&["program"], None)).unwrap();
+    // Accepts the next connection, answers its subscribe, and says how long it took to come.
+    let next = |since: std::time::Instant| {
+        let mut ws = accept(&listener);
+        let waited = since.elapsed();
+        write(&mut ws, &hello("0.1"));
+        read(&mut ws);
+        (ws, waited)
+    };
+    let (ws, _) = next(std::time::Instant::now());
+    // Closed before any update: the waits are 1 second, then 2 (clause 11.3).
+    drop(ws);
+    let (ws, first) = next(std::time::Instant::now());
+    drop(ws);
+    let (mut ws, second) = next(std::time::Instant::now());
+    assert!(first < Duration::from_millis(1800), "{first:?}");
+    assert!(second >= Duration::from_millis(1800), "{second:?}");
+    // This connection delivers an update: the next wait is 1 second again.
+    write(
+        &mut ws,
+        &json!({"op": "update", "channel": "program", "seq": 1, "type": "ntx.text", "fields": {}}),
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    drop(ws);
+    let (_ws, third) = next(std::time::Instant::now());
+    assert!(third < Duration::from_millis(1800), "{third:?}");
+}
+
+#[test]
+fn reconnect_connects_again_when_reconnecting_is_off() {
+    let (listener, url) = fake_server("/");
+    let r = one_shot_receiver(&url);
+    drop(accept(&listener));
+    disconnect_reason(&r);
+    assert!(!connects_within(&listener, Duration::from_millis(1500)));
+    r.reconnect();
+    assert!(connects_within(&listener, WAIT));
+}
+
+#[test]
+fn a_receiver_does_not_subscribe_to_nothing() {
+    // Clause 8.3: ask for at least one channel the source has; otherwise nothing would arrive.
+    let (listener, url) = fake_server("/");
+    let r = Receiver::connect(&url, receiver_config(&["preview"], None)).unwrap();
+    let mut ws = accept(&listener);
+    write(&mut ws, &hello("0.1"));
+    let close = loop {
+        match ws.read().unwrap() {
+            WsMessage::Close(frame) => break frame.unwrap().code,
+            WsMessage::Text(text) => panic!("sent {text}"),
+            _ => {}
+        }
+    };
+    assert_eq!(u16::from(close), 1000);
+    assert!(disconnect_reason(&r).contains("none of the requested channels"));
+}
+
+#[test]
+fn a_receiver_closes_with_4008_without_hello() {
+    let (listener, url) = fake_server("/");
+    let r = one_shot_receiver(&url);
+    let mut ws = accept(&listener);
+    assert_eq!(fake_read_close(&mut ws), 4008);
+    assert!(disconnect_reason(&r).contains("no hello"));
 }

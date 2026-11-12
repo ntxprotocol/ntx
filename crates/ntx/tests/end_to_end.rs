@@ -128,11 +128,13 @@ fn invalid_updates_are_refused() {
     let bad: TypeDescriptor =
         serde_json::from_value(json!({"ntxType": "x", "schema": {"type": "object"}})).unwrap();
     assert!(s.announce(vec![bad]).is_err());
+    // Each description is within its 4096 characters; together they are too large.
     let big: TypeDescriptor = serde_json::from_value(json!({
-        "ntxType": "com.example.big", "description": huge, "schema": {"type": "object"}
+        "ntxType": "com.example.big", "description": "d".repeat(4096), "schema": {"type": "object"}
     }))
     .unwrap();
-    assert!(matches!(s.announce(vec![big]), Err(Error::TooLarge(_))));
+    let types = vec![big; ntx::MAX_MESSAGE_BYTES / 4096 + 1];
+    assert!(matches!(s.announce(types), Err(Error::TooLarge(_))));
     assert!(s.poll_event().is_none());
 }
 
@@ -297,4 +299,22 @@ fn discovery_finds_and_loses_a_source() {
             .poll_event()
             .is_none_or(|e| !matches!(e, BrowserEvent::Found(f) if f.id == id))
     );
+}
+
+#[test]
+fn names_and_ids_must_fit_hello() {
+    // Clause 18.4: names are 1 to 256 characters, ids 1 to 128.
+    let mut config = SourceConfig::new("n".repeat(257));
+    config.advertise = false;
+    assert!(matches!(Source::start(config), Err(Error::InvalidMessage(_))));
+    let mut config = receiver_config(&["program"], None);
+    config.id = String::new();
+    assert!(Receiver::connect("127.0.0.1:1", config).is_err());
+    let mut config = common::publisher_config("p", None);
+    config.name = "n".repeat(257);
+    assert!(ntx::Publisher::connect("127.0.0.1:1", config).is_err());
+    let mut config = ntx::RelayConfig::new("n".repeat(300));
+    config.port = 0;
+    config.advertise = false;
+    assert!(matches!(ntx::Relay::start(config), Err(Error::InvalidMessage(_))));
 }

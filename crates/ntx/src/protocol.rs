@@ -11,6 +11,14 @@ use crate::{Error, MAX_MESSAGE_BYTES, PROGRAM, Result};
 /// The fields of an item: any JSON object.
 pub type Fields = Map<String, Value>;
 
+/// An optional member: it may be absent (`None`, with `#[serde(default)]`), but not `null`,
+/// which the schemas reject (clause 7.3).
+fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    d: D,
+) -> std::result::Result<Option<T>, D::Error> {
+    T::deserialize(d).map(Some)
+}
+
 /// Largest allowed sequence number (2^53 − 1, clause 9.4).
 pub const MAX_SEQ: u64 = (1 << 53) - 1;
 
@@ -33,8 +41,15 @@ pub struct PairingChallenge {
 /// The pairing answer in `subscribe` or `publish` (clause 13.3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairingProof {
-    /// Base64 of HMAC-SHA256(pairing code, nonce).
-    pub proof: String,
+    /// Base64 of HMAC-SHA256(pairing code, nonce). Its format is checked with the proof itself,
+    /// so a malformed proof is `pairing_failed` and a missing one `pairing_required`
+    /// (clause 13.4).
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub proof: Option<String>,
 }
 
 /// First message from a source or relay (clause 8.1).
@@ -49,7 +64,11 @@ pub struct Hello {
     /// Changes whenever the source restarts (clause 9.4).
     pub session: String,
     /// Present when pairing is required.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub pairing: Option<PairingChallenge>,
 }
 
@@ -61,10 +80,18 @@ pub struct Subscribe {
     /// Who the receiver is.
     pub receiver: Endpoint,
     /// Channels to receive; `program` when absent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub channels: Option<Vec<String>>,
     /// Pairing proof, when the source asked for one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub pairing: Option<PairingProof>,
 }
 
@@ -76,10 +103,18 @@ pub struct Publish {
     /// The source the relay will serve.
     pub source: Endpoint,
     /// The published channels; `program` when absent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub channels: Option<Vec<String>>,
     /// Pairing proof, when the relay asked for one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub pairing: Option<PairingProof>,
 }
 
@@ -122,13 +157,56 @@ pub struct Heartbeat {
 
 /// An error report (clause 12).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawError")]
 pub struct ErrorMessage {
     /// What went wrong.
     pub code: ErrorCode,
     /// Optional text for logs.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub message: Option<String>,
 }
+
+/// An `error` as sent, before its code is known to be one of ours.
+#[derive(Deserialize)]
+struct RawError {
+    code: String,
+    #[serde(default, deserialize_with = "present")]
+    message: Option<String>,
+}
+
+impl TryFrom<RawError> for ErrorMessage {
+    type Error = Error;
+
+    /// An unknown code is treated as `bad_message` (clause 12.4); the code is kept at the start
+    /// of the message, for logs.
+    fn try_from(raw: RawError) -> Result<Self> {
+        check_len("code", &raw.code, 1, 64)?;
+        if let Some(text) = &raw.message {
+            check_len("message", text, 0, MAX_ERROR_CHARS)?;
+        }
+        if let Some(code) = ErrorCode::known(&raw.code) {
+            return Ok(ErrorMessage {
+                code,
+                message: raw.message,
+            });
+        }
+        let text = match raw.message {
+            Some(text) => format!("{}: {text}", raw.code),
+            None => raw.code,
+        };
+        Ok(ErrorMessage {
+            code: ErrorCode::BadMessage,
+            message: Some(text.chars().take(MAX_ERROR_CHARS).collect()),
+        })
+    }
+}
+
+/// Longest `message` in `error`, in characters (clause 18.4).
+pub(crate) const MAX_ERROR_CHARS: usize = 1024;
 
 /// A type descriptor (clause 15.4).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -137,10 +215,18 @@ pub struct TypeDescriptor {
     #[serde(rename = "ntxType")]
     pub ntx_type: String,
     /// Short name for people.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub title: Option<String>,
     /// Longer explanation for people.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub description: Option<String>,
     /// JSON Schema of the fields, limited to the allowed keywords.
     pub schema: Value,
@@ -240,18 +326,12 @@ impl Message {
                 if let Some(c) = &m.channels {
                     check_channels(c, false)?;
                 }
-                if let Some(p) = &m.pairing {
-                    check_proof(&p.proof)?;
-                }
             }
             Message::Publish(m) => {
                 check_version(&m.ntx)?;
                 check_endpoint(&m.source)?;
                 if let Some(c) = &m.channels {
                     check_channels(c, true)?;
-                }
-                if let Some(p) = &m.pairing {
-                    check_proof(&p.proof)?;
                 }
             }
             Message::Announce(m) => {
@@ -269,9 +349,8 @@ impl Message {
             Message::Tally(_) => {}
             Message::Ping(h) | Message::Pong(h) => check_len("id", &h.id, 0, 64)?,
             Message::Error(e) => {
-                check_len("code", e.code.as_str(), 1, 64)?;
                 if let Some(text) = &e.message {
-                    check_len("message", text, 0, 1024)?;
+                    check_len("message", text, 0, MAX_ERROR_CHARS)?;
                 }
             }
         }
@@ -287,6 +366,14 @@ impl TypeDescriptor {
     /// [`Error::InvalidTypeName`] or [`Error::InvalidMessage`] describing the problem.
     pub fn validate(&self) -> Result<()> {
         check_type_name(&self.ntx_type)?;
+        for (what, text, max) in [
+            ("title", &self.title, 256),
+            ("description", &self.description, 4096),
+        ] {
+            if let Some(text) = text {
+                check_len(what, text, 0, max)?;
+            }
+        }
         if self.schema.get("type").and_then(Value::as_str) != Some("object") {
             return Err(Error::InvalidMessage(
                 "a type descriptor schema must have \"type\": \"object\"".into(),
@@ -296,8 +383,9 @@ impl TypeDescriptor {
     }
 }
 
-/// Error codes (clause 12.2). Unknown codes are kept as [`ErrorCode::Other`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Error codes (clause 12.2). An unknown code is received as [`ErrorCode::BadMessage`]
+/// (clause 12.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCode {
     /// `unsupported_version`: the versions are not compatible.
     UnsupportedVersion,
@@ -311,14 +399,12 @@ pub enum ErrorCode {
     BadMessage,
     /// `not_allowed`: a relay refused a publisher.
     NotAllowed,
-    /// A code this version does not know.
-    Other(String),
 }
 
 impl ErrorCode {
     /// The code as sent on the wire.
     #[must_use]
-    pub fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             ErrorCode::UnsupportedVersion => "unsupported_version",
             ErrorCode::PairingRequired => "pairing_required",
@@ -326,7 +412,6 @@ impl ErrorCode {
             ErrorCode::TooLarge => "too_large",
             ErrorCode::BadMessage => "bad_message",
             ErrorCode::NotAllowed => "not_allowed",
-            ErrorCode::Other(s) => s,
         }
     }
 
@@ -337,34 +422,33 @@ impl ErrorCode {
             ErrorCode::UnsupportedVersion => 4001,
             ErrorCode::PairingRequired | ErrorCode::PairingFailed | ErrorCode::NotAllowed => 4003,
             ErrorCode::TooLarge => 4009,
-            ErrorCode::BadMessage | ErrorCode::Other(_) => 4000,
+            ErrorCode::BadMessage => 4000,
         }
     }
-}
 
-impl From<&str> for ErrorCode {
-    fn from(s: &str) -> Self {
-        match s {
-            "unsupported_version" => ErrorCode::UnsupportedVersion,
-            "pairing_required" => ErrorCode::PairingRequired,
-            "pairing_failed" => ErrorCode::PairingFailed,
-            "too_large" => ErrorCode::TooLarge,
-            "bad_message" => ErrorCode::BadMessage,
-            "not_allowed" => ErrorCode::NotAllowed,
-            other => ErrorCode::Other(other.to_string()),
-        }
+    /// Whether reconnecting cannot help until the user changes something (clause 11.3).
+    #[must_use]
+    pub fn needs_user(&self) -> bool {
+        !matches!(self, ErrorCode::TooLarge | ErrorCode::BadMessage)
+    }
+
+    fn known(code: &str) -> Option<ErrorCode> {
+        [
+            ErrorCode::UnsupportedVersion,
+            ErrorCode::PairingRequired,
+            ErrorCode::PairingFailed,
+            ErrorCode::TooLarge,
+            ErrorCode::BadMessage,
+            ErrorCode::NotAllowed,
+        ]
+        .into_iter()
+        .find(|c| c.as_str() == code)
     }
 }
 
 impl Serialize for ErrorCode {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         s.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for ErrorCode {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
-        Ok(ErrorCode::from(String::deserialize(d)?.as_str()))
     }
 }
 
@@ -420,9 +504,13 @@ fn check_len(what: &str, s: &str, min: usize, max: usize) -> Result<()> {
     Ok(())
 }
 
-fn check_endpoint(e: &Endpoint) -> Result<()> {
+/// Longest `name` of a source, receiver or publisher, in characters (clause 18.4).
+pub(crate) const MAX_NAME_CHARS: usize = 256;
+
+/// Checks the id and name of a source, receiver or publisher (clause 18.4).
+pub(crate) fn check_endpoint(e: &Endpoint) -> Result<()> {
     check_len("id", &e.id, 1, 128)?;
-    check_len("name", &e.name, 1, 256)
+    check_len("name", &e.name, 1, MAX_NAME_CHARS)
 }
 
 fn check_channels(channels: &[String], needs_program: bool) -> Result<()> {
@@ -438,44 +526,19 @@ fn check_channels(channels: &[String], needs_program: bool) -> Result<()> {
     Ok(())
 }
 
-fn check_proof(proof: &str) -> Result<()> {
-    // Base64 of 32 bytes: 43 characters and one "=".
-    let ok = proof.len() == 44
-        && proof.ends_with('=')
-        && proof[..43]
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/');
-    if ok {
-        Ok(())
-    } else {
-        Err(Error::InvalidMessage("invalid pairing proof".into()))
-    }
-}
-
-const ALLOWED_KEYWORDS: &[&str] = &[
-    "type",
-    "title",
-    "description",
-    "properties",
-    "required",
-    "items",
-    "enum",
-    "default",
-    "examples",
-    "maxLength",
+const FIELD_TYPES: &[&str] = &[
+    "object", "array", "string", "number", "integer", "boolean", "null",
 ];
 
+/// Checks a field schema against `fieldSchema` in `type-descriptor.schema.json` (clause 15.4).
 fn check_field_schema(schema: &Value, at: &str) -> Result<()> {
     let obj = schema
         .as_object()
         .ok_or_else(|| Error::InvalidMessage(format!("{at} must be an object")))?;
     for (key, value) in obj {
-        if !ALLOWED_KEYWORDS.contains(&key.as_str()) {
-            return Err(Error::InvalidMessage(format!(
-                "{at}: keyword {key:?} is not allowed in type descriptors"
-            )));
-        }
-        match key.as_str() {
+        let ok = match key.as_str() {
+            "type" => value.as_str().is_some_and(|t| FIELD_TYPES.contains(&t)),
+            "title" | "description" => value.is_string(),
             "properties" => {
                 let props = value
                     .as_object()
@@ -483,9 +546,28 @@ fn check_field_schema(schema: &Value, at: &str) -> Result<()> {
                 for (name, sub) in props {
                     check_field_schema(sub, &format!("{at}.properties.{name}"))?;
                 }
+                true
             }
-            "items" => check_field_schema(value, &format!("{at}.items"))?,
-            _ => {}
+            "required" => value.as_array().is_some_and(|names| {
+                names.iter().all(Value::is_string)
+                    && names.iter().enumerate().all(|(i, n)| !names[..i].contains(n))
+            }),
+            "items" => {
+                check_field_schema(value, &format!("{at}.items"))?;
+                true
+            }
+            "enum" | "examples" => value.is_array(),
+            "default" => true,
+            // A JSON Schema integer may be written with a fraction of zero, as in `5.0`.
+            "maxLength" => value.as_f64().is_some_and(|n| n >= 0.0 && n.fract() == 0.0),
+            _ => {
+                return Err(Error::InvalidMessage(format!(
+                    "{at}: keyword {key:?} is not allowed in type descriptors"
+                )));
+            }
+        };
+        if !ok {
+            return Err(Error::InvalidMessage(format!("{at}.{key} is not valid")));
         }
     }
     Ok(())
@@ -523,5 +605,114 @@ mod tests {
             r#"{"op":"update","channel":"program","seq":1,"type":"ntx.text","fields":{"text":"hi"}}"#
         );
         assert_eq!(Message::parse(&m.to_json()).unwrap(), Some(m));
+    }
+
+    #[test]
+    fn unknown_error_codes_are_bad_message() {
+        let parsed = Message::parse(r#"{"op":"error","code":"com.example.overheated","message":"hot"}"#);
+        assert_eq!(
+            parsed.unwrap(),
+            Some(Message::Error(ErrorMessage {
+                code: ErrorCode::BadMessage,
+                message: Some("com.example.overheated: hot".into()),
+            }))
+        );
+        let parsed = Message::parse(r#"{"op":"error","code":"later"}"#).unwrap();
+        let Some(Message::Error(e)) = parsed else { panic!() };
+        assert_eq!(e.message.as_deref(), Some("later"));
+        // The message still fits its limit with the code in front.
+        let long = format!(r#"{{"op":"error","code":"x","message":"{}"}}"#, "m".repeat(1024));
+        let Some(Message::Error(e)) = Message::parse(&long).unwrap() else {
+            panic!()
+        };
+        assert_eq!(e.message.unwrap().chars().count(), 1024);
+        for bad in [
+            r#"{"op":"error","code":""}"#,
+            &format!(r#"{{"op":"error","code":"{}"}}"#, "c".repeat(65)),
+            &format!(r#"{{"op":"error","code":"x","message":"{}"}}"#, "m".repeat(1025)),
+        ] {
+            assert!(Message::parse(bad).is_err(), "{bad}");
+        }
+        assert!(ErrorCode::NotAllowed.needs_user() && !ErrorCode::BadMessage.needs_user());
+    }
+
+    #[test]
+    fn pairing_proofs_are_not_checked_by_the_parser() {
+        // A malformed proof is pairing_failed and a missing one pairing_required (clause 13.4).
+        for pairing in [r#"{"proof":"not-base64"}"#, "{}"] {
+            let text = format!(
+                r#"{{"op":"subscribe","ntx":"0.1","receiver":{{"id":"r","name":"R"}},"pairing":{pairing}}}"#
+            );
+            assert!(Message::parse(&text).unwrap().is_some(), "{text}");
+        }
+    }
+
+    fn descriptor(schema: Value) -> TypeDescriptor {
+        TypeDescriptor {
+            ntx_type: "com.example.t".into(),
+            title: None,
+            description: None,
+            schema,
+        }
+    }
+
+    #[test]
+    fn type_descriptor_limits() {
+        let ok = serde_json::json!({
+            "type": "object",
+            "title": "T",
+            "required": ["a"],
+            "properties": {"a": {"type": "array", "items": {"type": "string", "maxLength": 5}, "enum": [], "examples": [], "default": 1}}
+        });
+        assert!(descriptor(ok).validate().is_ok());
+        for bad in [
+            serde_json::json!({"type": "object", "properties": {"a": {"type": "text"}}}),
+            serde_json::json!({"type": "object", "title": 1}),
+            serde_json::json!({"type": "object", "required": ["a", "a"]}),
+            serde_json::json!({"type": "object", "required": [1]}),
+            serde_json::json!({"type": "object", "enum": {}}),
+            serde_json::json!({"type": "object", "maxLength": -1}),
+            serde_json::json!({"type": "object", "properties": []}),
+            serde_json::json!({"type": "object", "items": 1}),
+            serde_json::json!({"type": "object", "pattern": "x"}),
+            serde_json::json!({"type": "string"}),
+        ] {
+            assert!(descriptor(bad.clone()).validate().is_err(), "{bad}");
+        }
+        let mut long = descriptor(serde_json::json!({"type": "object"}));
+        long.title = Some("t".repeat(257));
+        assert!(long.validate().is_err());
+        long.title = None;
+        long.description = Some("d".repeat(4097));
+        assert!(long.validate().is_err());
+    }
+
+    #[test]
+    fn null_is_not_an_absent_member() {
+        // Each case and its answer as the spec's JSON Schemas give it (ajv 8, spec d76e9ba).
+        let r = r#""receiver":{"id":"r","name":"R"}"#;
+        let p = r#""source":{"id":"p","name":"P"}"#;
+        let t = r#""ntxType":"com.example.t""#;
+        let cases = [
+            (r#"{"op":"error","code":"bad_message","message":null}"#.to_string(), false),
+            (r#"{"op":"error","code":"bad_message"}"#.to_string(), true),
+            (format!(r#"{{"op":"subscribe","ntx":"0.1",{r},"pairing":null}}"#), false),
+            (format!(r#"{{"op":"subscribe","ntx":"0.1",{r},"channels":null}}"#), false),
+            (format!(r#"{{"op":"subscribe","ntx":"0.1",{r},"pairing":{{"proof":null}}}}"#), false),
+            (format!(r#"{{"op":"subscribe","ntx":"0.1",{r},"pairing":{{}}}}"#), true),
+            (format!(r#"{{"op":"publish","ntx":"0.1",{p},"channels":null}}"#), false),
+            (format!(r#"{{"op":"publish","ntx":"0.1",{p},"pairing":null}}"#), false),
+            (
+                r#"{"op":"hello","ntx":"0.1","source":{"id":"s","name":"S"},"channels":["program"],"session":"x","pairing":null}"#.to_string(),
+                false,
+            ),
+            (format!(r#"{{"op":"announce","types":[{{{t},"title":null,"schema":{{"type":"object"}}}}]}}"#), false),
+            (format!(r#"{{"op":"announce","types":[{{{t},"description":null,"schema":{{"type":"object"}}}}]}}"#), false),
+            (format!(r#"{{"op":"announce","types":[{{{t},"schema":{{"type":"object","maxLength":5.0}}}}]}}"#), true),
+            (format!(r#"{{"op":"announce","types":[{{{t},"schema":{{"type":"object","maxLength":5.5}}}}]}}"#), false),
+        ];
+        for (text, valid) in cases {
+            assert_eq!(Message::parse(&text).is_ok(), valid, "{text}");
+        }
     }
 }

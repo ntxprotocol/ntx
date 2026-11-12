@@ -35,3 +35,37 @@ All notable changes are listed here. The format follows
 - Closing a connection waits briefly for the other side's close, so a final `error` is not lost
   (Windows resets connections closed with unread data). Close reasons are cut to fit a close
   frame.
+- `Receiver::reconnect` and `Publisher::reconnect` (C ABI: `ntx_receiver_reconnect`,
+  `ntx_publisher_reconnect`): connect again now, also after an error that stopped reconnecting.
+
+### Changed
+
+Following the spec's interop errata (spec commit `d76e9ba`):
+
+- Clause 11.3: after `unsupported_version`, `pairing_required`, `pairing_failed` or
+  `not_allowed`, receivers and publishers report the error and wait for `reconnect` instead of
+  retrying. With `reconnect: false` they now also wait for `reconnect()` after a lost connection
+  (before, their background task ended). The wait goes back to 1 second only after an `update`
+  (a publisher: after a connection that lasted 10 seconds). `ntx recv` and `ntx publish` exit
+  with an error in these cases. The new `ErrorCode::needs_user` tells these errors apart.
+- Clause 8.3: `ReceiverEvent::Connected` comes with the first `update`, which confirms the
+  subscription (an earlier `announce` is held until then). Receivers ask only for channels listed
+  in `hello` (and close instead of subscribing to none of them), and close with 4003 instead of
+  subscribing when a pairing code is needed and they have none.
+- Clauses 8.6, 11.2, 12.5: timeouts close with 4008: no `subscribe` or `publish` within 10
+  seconds, no `hello` within 10 seconds, or nothing received for 15 seconds.
+- Clause 12.4: an unknown error code is received as `bad_message`, with the code at the start of
+  the message. `ErrorCode::Other`, `impl Deserialize for ErrorCode` and
+  `impl From<&str> for ErrorCode` are removed, and `ErrorCode` is `Copy`.
+- Clauses 13.3, 13.4: pairing codes are compared in NFC. A malformed proof is `pairing_failed` and
+  a missing one `pairing_required`; `PairingProof::proof` is now optional.
+- Clause 16.4: numbers become text as ECMAScript `Number.prototype.toString` writes them (`3.0` →
+  `3`, `1e21` → `1e+21`).
+- Clauses 16.3, 16.5: only spaces and tabs around a field path are ignored; a pattern renders
+  empty text for a cleared channel.
+- Clause 6.2: names are shortened without splitting a grapheme cluster; display names are cut to
+  256 characters, and sources, relays, receivers and publishers refuse ids and names outside
+  the clause 18.4 limits.
+- Clauses 7.3, 18.4: type descriptors check `title` and `description` lengths and the value of
+  every allowed schema keyword. Optional members may be absent but not `null`, as in the
+  schemas (`{"proof": null}` is `bad_message`).

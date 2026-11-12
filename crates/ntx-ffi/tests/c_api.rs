@@ -60,6 +60,7 @@ type UpdateFn<T> =
 type TextFn<T> = unsafe extern "C" fn(*const T, *const c_char, *const c_char) -> c_int;
 type StringFn<T> = unsafe extern "C" fn(*const T, *const c_char) -> c_int;
 type EventFn<T> = unsafe extern "C" fn(*const T, u32) -> *mut c_char;
+type HandleFn<T> = unsafe extern "C" fn(*const T) -> c_int;
 
 fn update<T>(f: UpdateFn<T>, handle: *const T, type_name: &str, fields: &str) -> Result<u64, c_int> {
     let (channel, type_name, fields) = (c("program"), c(type_name), c(fields));
@@ -88,6 +89,12 @@ fn with_string<T>(f: StringFn<T>, handle: *const T, text: &str) -> c_int {
     let text = c(text);
     // SAFETY: a valid string and a live or null handle.
     unsafe { f(handle, text.as_ptr()) }
+}
+
+/// Calls a function that takes only a handle: reconnect.
+fn with_handle<T>(f: HandleFn<T>, handle: *const T) -> c_int {
+    // SAFETY: a live or null handle.
+    unsafe { f(handle) }
 }
 
 fn event<T>(f: EventFn<T>, handle: *const T, timeout_ms: u32) -> Option<Value> {
@@ -388,4 +395,39 @@ fn publisher_and_relay_errors() {
     unsafe { ntx_publisher_free(ptr::null_mut()) };
     // SAFETY: freeing null is allowed.
     unsafe { ntx_relay_free(ptr::null_mut()) };
+}
+
+/// Clause 11.3: after `pairing_required` a client waits until it is asked to try again.
+fn stops_until_reconnect<T>(events: EventFn<T>, reconnect: HandleFn<T>, handle: *const T) {
+    let next = || event(events, handle, 5000);
+    assert_eq!(wait_for(next, "error")["code"], "pairing_required");
+    wait_for(next, "disconnected");
+    assert_eq!(event(events, handle, 1500), None);
+    assert_eq!(with_handle(reconnect, ptr::null()), NTX_ERR_ARGUMENT);
+    assert_eq!(with_handle(reconnect, handle), NTX_OK);
+    assert_eq!(wait_for(next, "error")["code"], "pairing_required");
+}
+
+#[test]
+fn clients_without_a_pairing_code_wait_for_reconnect() {
+    let source = start(&json!({
+        "name": "C API (paired)", "bind": "127.0.0.1", "port": 0, "pairing_code": "2468", "advertise": false
+    }));
+    let address = source_info(source)["address"].as_str().unwrap().to_string();
+    let receiver = connect(&address, r#"{"name": "C API (no code)"}"#).unwrap();
+    stops_until_reconnect(ntx_receiver_wait_event, ntx_receiver_reconnect, receiver);
+    receiver_free(receiver);
+    source_free(source);
+
+    let relay =
+        relay_start(&json!({"name": "paired", "port": 0, "pairing_code": "1357", "advertise": false}));
+    // SAFETY: a live handle.
+    let info = take_json(unsafe { ntx_relay_info(relay) }).unwrap();
+    let url = format!("ws://{}/publish", info["address"].as_str().unwrap());
+    let publisher = publisher_connect(&url, r#"{"name": "no code"}"#).unwrap();
+    stops_until_reconnect(ntx_publisher_wait_event, ntx_publisher_reconnect, publisher);
+    // SAFETY: handles from this library, freed once.
+    unsafe { ntx_publisher_free(publisher) };
+    // SAFETY: as above.
+    unsafe { ntx_relay_free(relay) };
 }
