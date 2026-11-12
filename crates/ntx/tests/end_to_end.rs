@@ -125,6 +125,12 @@ fn invalid_updates_are_refused() {
     ));
     let huge = "x".repeat(ntx::MAX_MESSAGE_BYTES);
     assert!(matches!(s.update_text("program", &huge), Err(Error::TooLarge(_))));
+    // At most 16 levels of nesting in fields (clause 18.2).
+    let deep = (0..16).fold(json!(1), |inner, _| json!([inner]));
+    assert!(matches!(
+        s.update("program", "ntx.text", fields(&json!({"deep": deep}))),
+        Err(Error::InvalidMessage(_))
+    ));
     let bad: TypeDescriptor =
         serde_json::from_value(json!({"ntxType": "x", "schema": {"type": "object"}})).unwrap();
     assert!(s.announce(vec![bad]).is_err());

@@ -6,7 +6,9 @@ use std::collections::HashMap;
 use serde_json::Value;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::protocol::{Announce, Fields, MAX_SEQ, Message, TypeDescriptor, Update, check_type_name};
+use crate::protocol::{
+    Announce, Fields, MAX_SEQ, Message, TypeDescriptor, Update, check_fields_depth, check_type_name,
+};
 use crate::wire::{self, frame};
 use crate::{Error, PROGRAM, Result};
 
@@ -49,6 +51,7 @@ impl Store {
             return Err(Error::UnknownChannel(channel.to_string()));
         }
         check_type_name(type_name)?;
+        check_fields_depth(&fields)?;
         if self.seq >= MAX_SEQ {
             return Err(Error::InvalidMessage(
                 "sequence numbers exhausted; restart the source".into(),

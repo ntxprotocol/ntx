@@ -68,6 +68,8 @@ All notable changes are listed here. The format follows
   falls back to the host name. Before, Preview could fail with "No route to host".
 - Dropping a `Source` or `Relay` waits (up to 1 second) until its connections have sent their
   close frames, so a program that exits right away no longer resets them.
+- Clause 18.2: `fields` nested deeper than 16 levels are refused: `bad_message` when received,
+  `Error::InvalidMessage` when sent. Before, only serde's limit of 128 levels applied.
 
 ### Changed
 

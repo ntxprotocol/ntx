@@ -81,6 +81,15 @@ fn relay_hello_and_forwarding() {
         &json!({"op": "update", "channel": "preview", "seq": 100, "type": "ntx.text", "fields": {}}),
     );
     assert_eq!(read_json(&mut ws)["code"], "bad_message");
+    // Fields nested deeper than 16 levels (clause 18.2).
+    let deep = (0..16).fold(json!(1), |inner, _| json!([inner]));
+    send_json(
+        &mut ws,
+        &json!({"op": "update", "channel": "program", "seq": 101, "type": "ntx.text", "fields": {"deep": deep}}),
+    );
+    let error = read_json(&mut ws);
+    assert_eq!(error["code"], "bad_message");
+    assert!(error["message"].as_str().unwrap().contains("nested"), "{error}");
     send_json(&mut ws, &json!({"op": "error", "code": "bad_message"}));
     send_json(&mut ws, &json!({"op": "ping", "id": "9"}));
     assert_eq!(read_json(&mut ws), json!({"op": "pong", "id": "9"}));

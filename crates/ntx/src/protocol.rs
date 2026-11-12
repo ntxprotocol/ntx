@@ -365,6 +365,7 @@ impl Message {
                     return Err(Error::InvalidMessage("seq is larger than 2^53 - 1".into()));
                 }
                 check_type_name(&m.type_name)?;
+                check_fields_depth(&m.fields)?;
             }
             Message::Tally(_) => {}
             Message::Ping(h) | Message::Pong(h) => check_len("id", &h.id, 0, 64)?,
@@ -527,6 +528,27 @@ fn check_len(what: &str, s: &str, min: usize, max: usize) -> Result<()> {
 /// Longest `name` of a source, receiver or publisher, in characters (clause 18.4).
 pub(crate) const MAX_NAME_CHARS: usize = 256;
 
+/// The most levels of JSON nesting in `fields`, the object itself being level 1 (clause 18.2).
+pub(crate) const MAX_FIELDS_DEPTH: usize = 16;
+
+/// Checks the nesting limit of `fields` (clause 18.2), looking no deeper than the limit.
+pub(crate) fn check_fields_depth(fields: &Fields) -> Result<()> {
+    fn fits(value: &Value, levels: usize) -> bool {
+        match value {
+            Value::Object(o) => levels > 0 && o.values().all(|v| fits(v, levels - 1)),
+            Value::Array(a) => levels > 0 && a.iter().all(|v| fits(v, levels - 1)),
+            _ => true,
+        }
+    }
+    if fields.values().all(|v| fits(v, MAX_FIELDS_DEPTH - 1)) {
+        Ok(())
+    } else {
+        Err(Error::InvalidMessage(format!(
+            "fields are nested deeper than {MAX_FIELDS_DEPTH} levels"
+        )))
+    }
+}
+
 /// Checks the id and name of a source, receiver or publisher (clause 18.4).
 pub(crate) fn check_endpoint(e: &Endpoint) -> Result<()> {
     check_len("id", &e.id, 1, 128)?;
@@ -644,6 +666,28 @@ mod tests {
         for seq in ["42.5", "-1", "-0.5", "9007199254740992.0", "\"42\""] {
             assert!(parse(seq).is_err(), "{seq}");
         }
+    }
+
+    #[test]
+    fn fields_nesting_is_limited() {
+        // `levels` levels: the fields object, then objects and arrays in turn.
+        let nested = |levels: usize| {
+            let mut inner = "1".to_string();
+            for level in (2..=levels).rev() {
+                inner = if level % 2 == 0 {
+                    format!("[{inner}]")
+                } else {
+                    format!(r#"{{"a":{inner}}}"#)
+                };
+            }
+            format!(
+                r#"{{"op":"update","channel":"program","seq":1,"type":"ntx.text","fields":{{"a":{inner},"b":[]}}}}"#
+            )
+        };
+        assert!(Message::parse(&nested(1)).unwrap().is_some());
+        assert!(Message::parse(&nested(MAX_FIELDS_DEPTH)).unwrap().is_some());
+        let error = Message::parse(&nested(MAX_FIELDS_DEPTH + 1)).unwrap_err();
+        assert!(error.to_string().contains("nested deeper than 16"), "{error}");
     }
 
     #[test]
