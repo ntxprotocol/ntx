@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 
+use crate::wire::lock;
 use crate::{Error, Result, SERVICE_TYPE};
 
 /// A source found on the network (clause 6).
@@ -104,7 +105,7 @@ impl Browser {
                 let pairing_required = info.get_property_val_str("pair") == Some("1");
                 let tls = info.get_property_val_str("tls") == Some("1");
                 let path = info.get_property_val_str("path").unwrap_or("/").to_string();
-                let mut known = self.known.lock().unwrap();
+                let mut known = lock(&self.known);
                 let previous = known.get(&info.fullname);
                 // mDNS reports each network interface separately, so collect all addresses.
                 let mut addresses: Vec<IpAddr> = info
@@ -155,7 +156,7 @@ impl Browser {
                 news.then_some(BrowserEvent::Found(found))
             }
             ServiceEvent::ServiceRemoved(_, fullname) => {
-                let (id, name) = self.known.lock().unwrap().remove(&fullname).map_or_else(
+                let (id, name) = lock(&self.known).remove(&fullname).map_or_else(
                     || (fullname.clone(), instance_name(&fullname)),
                     |s| (s.id, s.name),
                 );
