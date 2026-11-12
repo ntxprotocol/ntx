@@ -206,13 +206,19 @@ fn receiver_rejects_other_versions_and_bad_hellos() {
     }
 }
 
-#[test]
-fn receiver_filters_repeats_and_reports_everything_else() {
+/// A one-shot receiver that a fake source has greeted, and the fake's side, after `subscribe`.
+fn subscribed_to_fake() -> (Receiver, tungstenite::WebSocket<std::net::TcpStream>) {
     let (listener, url) = fake_server("/");
     let r = one_shot_receiver(&url);
     let mut ws = accept(&listener);
     write(&mut ws, &hello("0.1"));
     assert_eq!(read(&mut ws)["op"], "subscribe");
+    (r, ws)
+}
+
+#[test]
+fn receiver_filters_repeats_and_reports_everything_else() {
+    let (r, mut ws) = subscribed_to_fake();
 
     let update = |seq: u64, text: &str| json!({"op": "update", "channel": "program", "seq": seq, "type": "ntx.text", "fields": {"text": text}});
     write(&mut ws, &update(3, "three"));
@@ -544,11 +550,7 @@ fn a_receiver_closes_with_4008_without_hello() {
 
 #[test]
 fn receiver_closes_when_dropped() {
-    let (listener, url) = fake_server("/");
-    let r = one_shot_receiver(&url);
-    let mut ws = accept(&listener);
-    write(&mut ws, &hello("0.1"));
-    assert_eq!(read(&mut ws)["op"], "subscribe");
+    let (r, mut ws) = subscribed_to_fake();
     write(
         &mut ws,
         &json!({"op": "update", "channel": "program", "seq": 0, "type": "ntx.text", "fields": {}}),
