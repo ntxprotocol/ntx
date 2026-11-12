@@ -6,9 +6,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc as tmpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+use crate::origin::{self, normalize_origin};
 use crate::protocol::{Endpoint, ErrorCode, Hello, Message, Publish, Tally, check_endpoint};
 use crate::source::Mdns;
-use crate::wire::{self, Ended, Incoming, Peer, lock};
+use crate::wire::{self, Ended, Incoming, lock};
 use crate::{DEFAULT_PORT, Error, PROGRAM, PROTOCOL_VERSION, Result, Source, SourceConfig, display_name};
 
 /// Most publishers a relay serves at once.
@@ -287,42 +288,6 @@ fn admit(origin: Option<&str>, address: IpAddr, allowed: &HashSet<String>) -> Ad
     }
 }
 
-/// Normalises a web origin, `http(s)://host[:port]`, for comparison: lowercase, without a
-/// trailing slash or the scheme's default port. Other schemes cannot be allowed.
-fn normalize_origin(origin: &str) -> Result<String> {
-    let invalid = || Error::InvalidOrigin(origin.to_string());
-    let (scheme, rest) = origin.trim().split_once("://").ok_or_else(invalid)?;
-    let rest = rest.strip_suffix('/').unwrap_or(rest);
-    let scheme_ok = scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https");
-    if !scheme_ok || rest.contains(['/', '?', '#', '@']) || rest.contains(char::is_whitespace) {
-        return Err(invalid());
-    }
-    let (scheme, rest) = (scheme.to_ascii_lowercase(), rest.to_ascii_lowercase());
-    let (host, port) = match rest.rsplit_once(':') {
-        Some((host, port)) if !port.contains(']') => {
-            (host, Some(port.parse::<u16>().map_err(|_| invalid())?))
-        }
-        _ => (rest.as_str(), None),
-    };
-    if host.is_empty() {
-        return Err(invalid());
-    }
-    let default_port = matches!((scheme.as_str(), port), ("http", Some(80)) | ("https", Some(443)));
-    Ok(match port {
-        Some(port) if !default_port => format!("{scheme}://{host}:{port}"),
-        _ => format!("{scheme}://{host}"),
-    })
-}
-
-/// Refuses a publisher with `not_allowed` (clause 14.5).
-async fn refuse<S>(peer: &mut Peer<S>, reason: String)
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let Ended(reason) = peer.reject(ErrorCode::NotAllowed, reason).await;
-    tracing::debug!("refused a publisher: {reason}");
-}
-
 /// Serves one publisher from WebSocket upgrade to disconnect.
 async fn serve(incoming: Incoming, shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
     let Incoming {
@@ -344,9 +309,9 @@ async fn serve(incoming: Incoming, shared: Arc<Shared>, mut stop: watch::Receive
                     origin: origin.clone(),
                 });
             }
-            return refuse(&mut peer, format!("origin {origin} is not allowed to publish")).await;
+            return origin::refuse(&mut peer, format!("origin {origin} is not allowed to publish")).await;
         }
-        Admission::Refused(reason) => return refuse(&mut peer, reason).await,
+        Admission::Refused(reason) => return origin::refuse(&mut peer, reason).await,
     };
     let hello = Hello {
         ntx: PROTOCOL_VERSION.to_string(),
@@ -373,7 +338,7 @@ async fn serve(incoming: Incoming, shared: Arc<Shared>, mut stop: watch::Receive
     let id = publish.source.id.clone();
     let (connection, replaced) = match register(&shared, &id, origin.as_deref()) {
         Ok(registered) => registered,
-        Err(reason) => return refuse(&mut peer, reason).await,
+        Err(reason) => return origin::refuse(&mut peer, reason).await,
     };
     let mut source = match start_source(&shared, publish).await {
         Ok(source) => source,
@@ -439,6 +404,15 @@ fn register(
     origin: Option<&str>,
 ) -> std::result::Result<(u64, oneshot::Receiver<()>), String> {
     let mut state = lock(&shared.state);
+    // Only the same page or program may take over its source, e.g. after a reload (clause 14.4):
+    // source ids are public, so another origin must not replace it.
+    if state
+        .served
+        .get(id)
+        .is_some_and(|s| s.origin.as_deref() != origin)
+    {
+        return Err(format!("source {id} is already published from another origin"));
+    }
     let others: Vec<&Served> = state
         .served
         .iter()
@@ -534,36 +508,6 @@ async fn forward_tally(mut tally: watch::Receiver<Tally>, out: tmpsc::Sender<WsM
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn origins_are_normalised() {
-        for (given, normal) in [
-            ("https://Example.COM/", "https://example.com"),
-            ("http://example.com:80", "http://example.com"),
-            ("https://example.com:443", "https://example.com"),
-            ("https://example.com:8443", "https://example.com:8443"),
-            ("http://[::1]:3000", "http://[::1]:3000"),
-            ("http://[::1]", "http://[::1]"),
-        ] {
-            assert_eq!(normalize_origin(given).unwrap(), normal, "{given}");
-        }
-        for bad in [
-            "null",
-            "example.com",
-            "https://",
-            "https://a/b",
-            "https://a:x",
-            "1http://a",
-            "https://a b",
-            "chrome-extension://abcdef",
-            "file://x",
-        ] {
-            assert!(
-                matches!(normalize_origin(bad), Err(Error::InvalidOrigin(_))),
-                "{bad}"
-            );
-        }
-    }
 
     #[test]
     fn questions_to_the_app_are_limited() {

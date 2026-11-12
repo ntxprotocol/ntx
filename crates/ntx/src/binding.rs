@@ -26,8 +26,10 @@ pub fn lookup<'a>(fields: &'a Fields, path: &str) -> Option<&'a Value> {
     Some(value)
 }
 
+/// A decimal array index without leading zeros (clause 16.2): `01` is not an index.
 fn parse_index(part: &str) -> Option<usize> {
-    if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+    let leading_zero = part.len() > 1 && part.starts_with('0');
+    if part.is_empty() || leading_zero || !part.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     part.parse().ok()
@@ -166,6 +168,9 @@ mod tests {
         assert_eq!(field_text(&f, "verses.0.number"), "16");
         assert_eq!(field_text(&f, "verses.1.text"), "");
         assert_eq!(field_text(&f, "verses.+0.text"), "");
+        // No leading zeros (clause 16.2).
+        assert_eq!(field_text(&f, "verses.00.text"), "");
+        assert_eq!(field_text(&f, "verses.01.text"), "");
         assert_eq!(field_text(&f, "missing"), "");
         assert_eq!(field_text(&f, "lines"), "one\ntwo\n3");
         assert_eq!(field_text(&f, "on"), "true");

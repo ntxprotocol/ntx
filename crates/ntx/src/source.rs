@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
@@ -7,6 +7,7 @@ use mdns_sd::{ServiceDaemon, ServiceInfo};
 use tokio::sync::{mpsc as tmpsc, watch};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+use crate::origin;
 use crate::protocol::{
     Endpoint, Fields, Hello, MAX_NAME_CHARS, Message, Subscribe, Tally, TypeDescriptor, check_endpoint,
 };
@@ -34,6 +35,10 @@ pub struct SourceConfig {
     pub pairing_code: Option<String>,
     /// Advertise with mDNS. Defaults to `true`.
     pub advertise: bool,
+    /// Web page origins, e.g. `https://example.com`, that may read this source although they are
+    /// not on this computer or the local network (clause 8.7). Pages from elsewhere are refused
+    /// with `not_allowed`, unless the source requires pairing.
+    pub allowed_origins: Vec<String>,
 }
 
 impl SourceConfig {
@@ -48,6 +53,7 @@ impl SourceConfig {
             path: "/".to_string(),
             pairing_code: None,
             advertise: true,
+            allowed_origins: Vec::new(),
         }
     }
 }
@@ -90,6 +96,8 @@ struct Shared {
     identity: Endpoint,
     path: String,
     pairing_code: Option<String>,
+    /// Normalised origins of web pages allowed to read beyond the local network (clause 8.7).
+    allowed_origins: HashSet<String>,
     session: String,
     state: Mutex<State>,
     events: mpsc::Sender<SourceEvent>,
@@ -129,6 +137,11 @@ impl Source {
         };
         check_endpoint(&identity)?;
         crate::pairing::check_code(config.pairing_code.as_deref())?;
+        let allowed_origins = config
+            .allowed_origins
+            .iter()
+            .map(|o| origin::normalize_origin(o))
+            .collect::<Result<HashSet<_>>>()?;
         let store = Store::new(config.channels.clone())?;
         let (listener, local_addr) = wire::listen(config.bind, config.port)?;
         let mdns = if config.advertise {
@@ -147,6 +160,7 @@ impl Source {
             identity,
             path: config.path,
             pairing_code: config.pairing_code,
+            allowed_origins,
             session: uuid::Uuid::new_v4().simple().to_string(),
             state: Mutex::new(State {
                 store,
@@ -328,11 +342,17 @@ async fn serve(incoming: Incoming, shared: Arc<Shared>, mut stop: watch::Receive
         address,
         slot,
     } = incoming;
-    let mut peer =
+    let (mut peer, page) =
         match wire::unless_stopped(&mut stop, wire::accept(stream, &shared.path, "subscribe")).await {
-            Ok((peer, _)) => peer,
+            Ok(accepted) => accepted,
             Err(Ended(e)) => return tracing::debug!("upgrade from {address} failed: {e}"),
         };
+    // Pairing checks every receiver; without it, web pages from the internet need permission.
+    if shared.pairing_code.is_none() {
+        if let Err(reason) = origin::may_read(page.as_deref(), &shared.allowed_origins) {
+            return origin::refuse(&mut peer, reason).await;
+        }
+    }
     let hello = Hello {
         ntx: PROTOCOL_VERSION.to_string(),
         source: shared.identity.clone(),

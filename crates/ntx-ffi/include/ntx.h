@@ -111,7 +111,8 @@ char *ntx_render(const char *fields_json, const char *pattern);
 char *ntx_display_name(const char *name);
 
 // Starts a source. `config_json` is an object with `name` and optionally `id`, `channels`,
-// `bind`, `port`, `path`, `pairing_code` and `advertise` (see `SourceConfig` in the Rust docs).
+// `bind`, `port`, `path`, `pairing_code`, `advertise` and `allowed_origins` (see `SourceConfig`
+// in the Rust docs).
 // On success `*out` receives the handle; free it with [`ntx_source_free`].
 //
 // # Safety

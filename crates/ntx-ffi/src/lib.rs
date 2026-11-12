@@ -438,6 +438,7 @@ struct SourceOptions {
     path: Option<String>,
     pairing_code: Option<String>,
     advertise: Option<bool>,
+    allowed_origins: Option<Vec<String>>,
 }
 
 impl From<SourceOptions> for SourceConfig {
@@ -450,12 +451,14 @@ impl From<SourceOptions> for SourceConfig {
         config.path = o.path.unwrap_or(config.path);
         config.pairing_code = o.pairing_code;
         config.advertise = o.advertise.unwrap_or(config.advertise);
+        config.allowed_origins = o.allowed_origins.unwrap_or_default();
         config
     }
 }
 
 /// Starts a source. `config_json` is an object with `name` and optionally `id`, `channels`,
-/// `bind`, `port`, `path`, `pairing_code` and `advertise` (see `SourceConfig` in the Rust docs).
+/// `bind`, `port`, `path`, `pairing_code`, `advertise` and `allowed_origins` (see `SourceConfig`
+/// in the Rust docs).
 /// On success `*out` receives the handle; free it with [`ntx_source_free`].
 ///
 /// # Safety

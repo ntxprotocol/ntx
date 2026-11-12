@@ -500,10 +500,10 @@ pub fn check_type_name(name: &str) -> Result<()> {
     }
 }
 
+/// `MAJOR.MINOR`, without leading zeros, so versions compare as strings (clause 19.1).
 fn check_version(v: &str) -> Result<()> {
-    let ok = v
-        .split_once('.')
-        .is_some_and(|(a, b)| is_digits(a) && is_digits(b));
+    let number = |n: &str| is_digits(n) && (n == "0" || !n.starts_with('0'));
+    let ok = v.split_once('.').is_some_and(|(a, b)| number(a) && number(b));
     if ok {
         Ok(())
     } else {
