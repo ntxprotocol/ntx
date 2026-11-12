@@ -6,6 +6,10 @@ All notable changes are listed here. The format follows
 
 ## Unreleased
 
+## [0.1.0] - 2026-11-12
+
+The first release: NTX 0.1 (Pre-Draft) in Rust, as a C library and as the `ntx` command.
+
 ### Added
 
 - `ntx` crate implementing NTX 0.1: `Source`, `Receiver`, `Browser` (mDNS), pairing, binding
@@ -136,3 +140,5 @@ Following the spec's interop errata (spec commit `d76e9ba`):
 - Clauses 7.3, 18.4: type descriptors check `title` and `description` lengths and the value of
   every allowed schema keyword. Optional members may be absent but not `null`, as in the
   schemas (`{"proof": null}` is `bad_message`).
+
+[0.1.0]: https://github.com/ntxprotocol/ntx/releases/tag/v0.1.0
